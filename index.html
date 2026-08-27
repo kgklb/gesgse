@@ -278,6 +278,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei
 .admin-topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border-2)}
 .admin-topbar h2{font-size:20px;font-weight:600}
 .admin-back-btn{padding:8px 14px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;font-size:13px;display:flex;align-items:center;gap:6px}
+.admin-topbar-right{display:flex;align-items:center;gap:10px}
+.admin-sync-indicator{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-3)}
+.admin-sync-indicator .sync-dot{width:8px;height:8px;border-radius:50%}
+.admin-sync-indicator.sync-connected .sync-dot{background:#10b981}
+.admin-sync-indicator.sync-connecting .sync-dot{background:#f59e0b;animation:pulse 1.2s infinite}
+.admin-sync-indicator.sync-failed .sync-dot{background:#ef4444}
+.admin-sync-indicator.sync-offline .sync-dot{background:#9ca3af}
+.admin-refresh-btn{padding:8px 12px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;font-size:12px;display:inline-flex;align-items:center;gap:6px;transition:all .2s}
+.admin-refresh-btn:hover{border-color:var(--gold);color:var(--gold)}
+.admin-refresh-btn.spinning svg{animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 
 /* Admin Dashboard */
 .dash-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:20px}
@@ -884,15 +895,26 @@ function subscribeOrdersRealtime() {
             const row = toCamel(payload.old);
             DB.orders = DB.orders.filter(o => o.id !== row.id);
           }
+          // 更新最新时间戳，避免轮询重复拉取
+          if (payload.new) {
+            const ct = new Date(payload.new.create_time || 0).getTime();
+            if (ct > _lastOrderUpdateTime) _lastOrderUpdateTime = ct;
+          }
           saveData(false); // 仅存本地，不回写云端
           render();
         }
       )
       .subscribe((status) => {
         console.log('[Realtime] orders channel:', status);
+        if (status === 'SUBSCRIBED') {
+          logSupabase('info', 'realtime', 'orders 实时订阅已连接');
+        } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+          logSupabase('warn', 'realtime', 'orders 实时订阅断开: ' + status + '，已降级为 8 秒轮询');
+        }
       });
   } catch (e) {
     console.warn('[Realtime] orders subscription failed:', e.message);
+    logSupabase('warn', 'realtime', 'orders 订阅初始化失败，使用轮询同步');
   }
 }
 
@@ -2230,13 +2252,25 @@ async function batchUpsert(table, data, batchSize = 500) {
 }
 
 // ============ 轮询同步 ============
+// 最近一次云端订单的最大更新时间戳，用于快速判断是否有新数据
+let _lastOrderUpdateTime = 0;
+let _pendingAdminBadge = 0; // 管理后台新订单红点计数
+
 function startPolling() {
   if (SUPABASE_POLL_TIMER) return;
   SUPABASE_POLL_TIMER = setInterval(async () => {
     if (!SUPABASE_ENABLED || !supabaseClient) return;
     try {
+      // --- 快查：先看最新订单的更新时间，无变更则跳过全量拉取 ---
+      const fastCheck = await fastCheckOrdersChanged();
+      if (fastCheck === false) {
+        // 无变化，不做全量同步，节省带宽
+        return;
+      }
+
       // 记录轮询前的 pending 订单数量和 ID 集合，用于新订单检测
       const prevPendingIds = new Set(DB.orders.filter(o => o.status === 'pending').map(o => o.id));
+      const prevOrderCount = DB.orders.length;
       // 记录轮询前的聊天消息数量，用于新消息检测
       const prevOrderChatCount = countTotalOrderChatMessages();
       const prevChatCount = countTotalChatMessages();
@@ -2244,33 +2278,38 @@ function startPolling() {
       await syncFromSupabase();
       await syncOrderChatFromSupabase();
 
-      // --- 新订单检测（仅打手端）---
+      // --- 新订单检测（管理员端：提示新订单红点）---
+      if (DB.currentIdentity === 'admin') {
+        const newOrders = DB.orders.filter(o => !prevPendingIds.has(o.id) && o.createTime && (Date.now() - o.createTime < 30000));
+        if (newOrders.length > 0) {
+          _pendingAdminBadge += newOrders.length;
+          updateAdminBadge();
+        }
+      }
+
+      // --- 新订单检测（打手端：语音播报）---
       if (DB.currentIdentity === 'booster') {
         const newPending = DB.orders.filter(o => o.status === 'pending' && !prevPendingIds.has(o.id));
         if (newPending.length > 0 && VOICE_STATE.initialized) {
-          // 同一个订单只播报一次
           newPending.forEach(o => {
             if (!VOICE_STATE.announcedOrders.has(o.id)) {
               VOICE_STATE.announcedOrders.add(o.id);
-              // 新订单优先级最高，立即打断当前语音
               speak('您有新的订单，请及时抢单', { priority: 'high' });
             }
           });
         }
       }
 
-  // --- 新消息检测 ---
-  const newOrderChatCount = countTotalOrderChatMessages();
-  const newChatCount = countTotalChatMessages();
-  if (newOrderChatCount > prevOrderChatCount || newChatCount > prevChatCount) {
-    // 判断是否有发给我的新消息
-    const hasNewMsgForMe = checkHasNewIncomingMessage(prevOrderChatCount, prevChatCount);
-    if (hasNewMsgForMe && VOICE_STATE.initialized) {
-      // 根据身份用不同的语音文案
-      const voiceText = DB.currentIdentity === 'admin' ? '您有新的客服消息' : '您有新的消息';
-      speak(voiceText, { priority: 'low' });
-    }
-  }
+      // --- 新消息检测 ---
+      const newOrderChatCount = countTotalOrderChatMessages();
+      const newChatCount = countTotalChatMessages();
+      if (newOrderChatCount > prevOrderChatCount || newChatCount > prevChatCount) {
+        const hasNewMsgForMe = checkHasNewIncomingMessage(prevOrderChatCount, prevChatCount);
+        if (hasNewMsgForMe && VOICE_STATE.initialized) {
+          const voiceText = DB.currentIdentity === 'admin' ? '您有新的客服消息' : '您有新的消息';
+          speak(voiceText, { priority: 'low' });
+        }
+      }
 
       // 更新标题未读数
       updateTitleUnread();
@@ -2281,9 +2320,60 @@ function startPolling() {
         setTimeout(scrollOrderChatBottom, 50);
       }
     } catch (e) {
-      // 静默失败
+      // 静默失败，不影响用户使用
+      logSupabase('warn', 'poll', '轮询异常: ' + (e.message || '未知'));
     }
   }, 8000); // 每 8 秒拉取一次
+}
+
+/**
+ * 快查订单是否有变化
+ * - 查最新 1 条订单的 create_time 和 update_time
+ * - 与上次时间戳比对，无变化则返回 false（跳过全量拉取）
+ * - 有变化或查询失败返回 true（继续全量同步）
+ */
+async function fastCheckOrdersChanged() {
+  if (!supabaseClient || !SUPABASE_ENABLED) return true;
+  try {
+    const { data, error } = await withTimeout(
+      supabaseClient
+        .from('orders')
+        .select('create_time, update_time, id')
+        .order('create_time', { ascending: false })
+        .limit(1),
+      3000
+    );
+    if (error || !data || data.length === 0) return true; // 查询失败走全量
+    const latestCreate = new Date(data[0].create_time || 0).getTime();
+    const latestUpdate = new Date(data[0].update_time || data[0].create_time || 0).getTime();
+    const latest = Math.max(latestCreate, latestUpdate);
+    if (latest <= _lastOrderUpdateTime && DB.orders.length > 0) {
+      return false; // 无变化
+    }
+    _lastOrderUpdateTime = latest;
+    return true;
+  } catch (e) {
+    return true; // 快查失败，走全量兜底
+  }
+}
+
+/** 更新管理后台新订单红点 */
+function updateAdminBadge() {
+  // 仅在管理员身份下生效，由 UI 层读取 _pendingAdminBadge
+  if (_pendingAdminBadge > 0 && DB.currentIdentity === 'admin') {
+    // 修改浏览器标签标题提示
+    if (document.title.indexOf('【') === -1) {
+      document.title = '【' + _pendingAdminBadge + '条新订单】' + document.title;
+    } else {
+      document.title = document.title.replace(/【\d+条新订单】/, '【' + _pendingAdminBadge + '条新订单】');
+    }
+  }
+}
+
+/** 清除管理后台新订单提示（点击订单页时调用） */
+function clearAdminBadge() {
+  _pendingAdminBadge = 0;
+  document.title = document.title.replace(/【\d+条新订单】/, '');
 }
 
 // ============== 语音播报 & 未读提示 ==============
@@ -3353,6 +3443,57 @@ function getSyncStatusLabel() {
     'offline': ''
   };
   return map[SUPABASE_STATUS] || '';
+}
+
+/** 管理后台同步状态文字（详细，管理员需要知道状态） */
+function getAdminSyncLabel() {
+  const map = {
+    'connecting': '同步中',
+    'connected': '已连接',
+    'failed': '同步异常',
+    'offline': '离线'
+  };
+  return map[SUPABASE_STATUS] || SUPABASE_STATUS;
+}
+
+/** 格式化同步时间（相对时间或绝对时间） */
+function formatSyncTime(ts) {
+  if (!ts) return '';
+  const diff = Date.now() - ts;
+  if (diff < 60000) return '刚刚';
+  if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前';
+  if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前';
+  const d = new Date(ts);
+  return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+}
+
+/** 管理后台刷新：强制从云端拉取最新数据 */
+let _adminRefreshing = false;
+async function refreshAdminData() {
+  if (_adminRefreshing) return;
+  if (!supabaseClient || !SUPABASE_ENABLED) {
+    toast('当前为本地模式，无需刷新');
+    return;
+  }
+  _adminRefreshing = true;
+  const btn = document.getElementById('adminRefreshBtn');
+  if (btn) btn.classList.add('spinning');
+  try {
+    const ok = await syncFromSupabase();
+    if (ok) {
+      toast('数据已更新');
+      SUPABASE_LAST_SYNC = Date.now();
+    } else {
+      toast('刷新失败，请检查云端连接');
+    }
+    render();
+  } catch (err) {
+    toast('刷新失败：' + (err.message || '未知错误'));
+  } finally {
+    _adminRefreshing = false;
+    const btn2 = document.getElementById('adminRefreshBtn');
+    if (btn2) btn2.classList.remove('spinning');
+  }
 }
 
 function renderUserTabs() {
@@ -6653,7 +6794,17 @@ function renderAdmin() {
       <div class="admin-main">
         <div class="admin-topbar">
           <h2>${ADMIN_NAV.find(n=>n.k===STATE.adminNav)?.n || '数据概览'}</h2>
-          <button class="admin-back-btn" onclick="logoutUser()">${ICONS.logout} 退出登录</button>
+          <div class="admin-topbar-right">
+            <div class="admin-sync-indicator sync-${SUPABASE_STATUS}" title="云端同步状态">
+              <span class="sync-dot"></span>
+              <span>${getAdminSyncLabel()}</span>
+            </div>
+            ${SUPABASE_LAST_SYNC ? `<span style="font-size:11px;color:var(--text-3)">上次同步: ${formatSyncTime(SUPABASE_LAST_SYNC)}</span>` : ''}
+            <button class="admin-refresh-btn" id="adminRefreshBtn" onclick="refreshAdminData()" title="从云端拉取最新数据">
+              ${ICONS.refresh} 刷新数据
+            </button>
+            <button class="admin-back-btn" onclick="logoutUser()">${ICONS.logout} 退出登录</button>
+          </div>
         </div>
         <div id="adminContent">${renderAdminContent()}</div>
       </div>
@@ -6662,6 +6813,8 @@ function renderAdmin() {
 
 function goAdmin(nav) {
   STATE.adminNav = nav;
+  // 进入订单管理页时清除新订单红点
+  if (nav === 'orders') clearAdminBadge();
   render();
 }
 
@@ -9337,19 +9490,26 @@ function initUserApp() {
 }
 
 function init() {
-  initSupabase();
+  // 1. 先读取本地数据并渲染，保证页面秒开，不依赖云端
   loadData();
-  // 加载登录态（决定是否显示登录页）
+  // 2. 加载登录态
   loadAuthState();
-  // 根据登录态同步身份
+  // 3. 根据登录态同步身份
   if (AUTH_STATE.isLoggedIn && AUTH_STATE.role === 'admin') {
     DB.currentIdentity = 'admin';
   } else if (AUTH_STATE.isLoggedIn) {
-    // 普通用户登录后，保留上次的身份（用户/打手），但如果当前 DB.currentIdentity 是 admin 则改回 user
     if (DB.currentIdentity === 'admin') DB.currentIdentity = 'user';
   }
+  // 4. 先渲染一次本地数据，用户立即看到内容
   render();
   updateTitleUnread();
+  // 5. 后台异步初始化 Supabase 并开始同步（不阻塞渲染）
+  setTimeout(() => {
+    const ok = initSupabase();
+    if (ok) {
+      loadSupabaseInBackground();
+    }
+  }, 100);
   // 首次用户交互后初始化语音（绕过浏览器自动播放限制）
   const firstInteract = () => {
     initVoice();
@@ -9366,7 +9526,6 @@ function init() {
 document.addEventListener('DOMContentLoaded', init);
 // Fallback if DOMContentLoaded already fired
 if (document.readyState !== 'loading') {
-  initSupabase();
   loadData();
   loadAuthState();
   if (AUTH_STATE.isLoggedIn && AUTH_STATE.role === 'admin') {
@@ -9375,6 +9534,11 @@ if (document.readyState !== 'loading') {
     DB.currentIdentity = 'user';
   }
   render();
+  // 后台初始化云端
+  setTimeout(() => {
+    const ok = initSupabase();
+    if (ok) loadSupabaseInBackground();
+  }, 100);
 }
 
 </script>
