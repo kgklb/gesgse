@@ -1885,9 +1885,108 @@ function settingsDBToRow(s) {
   };
 }
 
+/**
+ * 合并本地订单与云端订单（核心保护逻辑）
+ * 
+ * 策略：
+ * 1. 本地有、云端没有 → 保留本地（可能是刚创建尚未同步到云端的新订单，绝不能丢）
+ * 2. 云端有、本地没有 → 新增到本地
+ * 3. 两边都有 → 以更新时间（createTime / takeTime / completeTime 等最大时间戳）较新的为准
+ * 
+ * @param {Array} localOrders - 本地订单数组
+ * @param {Array} remoteOrders - 云端订单数组
+ * @param {Object} stats - 统计对象（写入 added/updated/localOnly）
+ * @returns {Array} 合并后的订单数组
+ */
+function mergeOrders(localOrders, remoteOrders, stats) {
+  const localMap = new Map();
+  (localOrders || []).forEach(o => localMap.set(o.id, o));
+  
+  const merged = [];
+  const usedLocalIds = new Set();
+  
+  // 遍历云端订单，逐条与本地对比
+  remoteOrders.forEach(remote => {
+    const local = localMap.get(remote.id);
+    if (!local) {
+      // 云端有、本地没有 → 新增
+      merged.push(remote);
+      if (stats) stats.added++;
+    } else {
+      // 两边都有 → 以更新时间较新的为准
+      // 比较双方各时间戳的最大值，作为"最后更新时间"
+      const localMax = Math.max(local.createTime || 0, local.takeTime || 0,
+        local.completeTime || 0, local.cancelTime || 0, local.payTime || 0, local.reviewTime || 0);
+      const remoteMax = Math.max(remote.createTime || 0, remote.takeTime || 0,
+        remote.completeTime || 0, remote.cancelTime || 0, remote.payTime || 0, remote.reviewTime || 0);
+      
+      if (remoteMax >= localMax) {
+        merged.push(remote);
+        if (stats && remoteMax > localMax) stats.updated++;
+        else if (stats) stats.unchanged++;
+      } else {
+        // 本地更新，保留本地（极端情况：本地刚改了状态还没同步上去）
+        merged.push(local);
+        if (stats) stats.unchanged++;
+      }
+      usedLocalIds.add(remote.id);
+    }
+  });
+  
+  // 本地有、云端没有的订单 → 保留（新创建但尚未同步到云端的订单）
+  localOrders.forEach(local => {
+    if (!usedLocalIds.has(local.id)) {
+      merged.push(local);
+      if (stats) stats.localOnly++;
+    }
+  });
+  
+  return merged;
+}
+
+/**
+ * 同步前备份本地订单数据（保护措施：如果同步后数据异常可恢复）
+ * 仅备份 orders 表，存到 localStorage 独立 key
+ */
+function backupLocalOrders() {
+  try {
+    const backup = {
+      time: Date.now(),
+      orderCount: (DB.orders || []).length,
+      orders: DB.orders || []
+    };
+    localStorage.setItem(STORAGE_KEY + '_orders_backup', JSON.stringify(backup));
+    return true;
+  } catch (e) {
+    console.warn('[Backup] 备份订单失败:', e.message);
+    return false;
+  }
+}
+
+/** 从备份恢复本地订单（系统设置页调用） */
+function restoreLocalOrders() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY + '_orders_backup');
+    if (!raw) return false;
+    const backup = JSON.parse(raw);
+    if (backup && Array.isArray(backup.orders)) {
+      DB.orders = backup.orders;
+      saveData(false);
+      return backup.orders.length;
+    }
+    return false;
+  } catch (e) {
+    console.warn('[Backup] 恢复订单失败:', e.message);
+    return false;
+  }
+}
+
 async function syncFromSupabase() {
   if (!supabaseClient) return false;
   try {
+    // 同步前备份本地订单，防止同步异常导致数据丢失
+    backupLocalOrders();
+    
     // 构建查询列表（与 TABLE_MAP 对应，跳过 settings 单独处理）
     const tablesToFetch = TABLE_MAP.filter(t => t.table !== 'settings' && t.table !== 'admins');
     
@@ -1935,11 +2034,29 @@ async function syncFromSupabase() {
     }
     
     // 集合表（除 settings / chat_messages 特殊处理外）
+    // 注意：orders 表使用合并策略而非直接覆盖，防止本地新下单被云端旧数据覆盖丢失
+    let orderStats = { added: 0, updated: 0, unchanged: 0, localOnly: 0 };
     TABLE_MAP.forEach(t => {
       if (t.table === 'settings' || t.table === 'admins') return;
       if (t.table === 'chat_messages') return; // 单独处理
       if (!resultMap[t.table]?.data) return;
-      DB[t.key] = toCamel(resultMap[t.table].data);
+      
+      const remoteData = toCamel(resultMap[t.table].data);
+      
+      // orders 表特殊处理：合并策略，保护本地新创建但尚未同步到云端的订单
+      if (t.table === 'orders') {
+        const merged = mergeOrders(DB.orders || [], remoteData, orderStats);
+        DB[t.key] = merged;
+        // 记录同步统计到日志
+        if (orderStats.added > 0 || orderStats.updated > 0 || orderStats.localOnly > 0) {
+          addSyncLog('info', 'orders', 'pull',
+            `拉取 ${remoteData.length} 条，新增 ${orderStats.added}，更新 ${orderStats.updated}，保留本地 ${orderStats.localOnly} 条未上云订单`);
+        }
+        return;
+      }
+      
+      // 其他表直接覆盖（数据量小且主要由管理端维护）
+      DB[t.key] = remoteData;
     });
     
     // chat_messages 转为 { sessionId: [messages] } 结构
@@ -2059,6 +2176,40 @@ async function forceFetchPendingOrders() {
   } catch (e) {
     logSupabase('error', 'orders', `拉取待接单订单失败: ${e.message}`);
     return null;
+  }
+}
+
+/**
+ * 从云端按 ID 拉取单条订单并合并到本地（订单详情页兜底）
+ * @param {string} orderId - 订单 ID
+ * @returns {Promise<boolean>} 是否找到订单
+ */
+async function fetchOrderFromCloud(orderId) {
+  if (!supabaseClient || !SUPABASE_ENABLED || !orderId) return false;
+  try {
+    const { data, error } = await withTimeout(
+      supabaseClient.from('orders').select('*').eq('id', orderId).limit(1),
+      5000
+    );
+    if (error) throw error;
+    if (!data || data.length === 0) {
+      logSupabase('warn', 'order', `云端未找到订单: ${orderId}`);
+      return false;
+    }
+    const order = toCamel(data[0]);
+    // 合并到本地（有则更新，无则新增）
+    const idx = DB.orders.findIndex(o => o.id === order.id);
+    if (idx >= 0) {
+      DB.orders[idx] = order;
+    } else {
+      DB.orders.push(order);
+    }
+    saveData(false);
+    logSupabase('info', 'order', `从云端拉取订单: ${orderId}`);
+    return true;
+  } catch (e) {
+    logSupabase('error', 'order', `拉取订单失败 ${orderId}: ${e.message}`);
+    return false;
   }
 }
 
@@ -2899,6 +3050,23 @@ function formatTimeShort(ts) {
 }
 function formatMoney(n) { return (n || 0).toFixed(2); }
 function genId(prefix) { return prefix + Date.now().toString(36) + Math.random().toString(36).substr(2,5); }
+
+/**
+ * 生成唯一订单号
+ * 格式：O + 时间戳后10位 + 2位随机数（如 O1725000000AB）
+ * 自动去重：如果和已有订单重复则重新生成
+ */
+function genOrderId() {
+  let id;
+  let attempts = 0;
+  const existingIds = new Set(DB.orders.map(o => o.id));
+  do {
+    const rand = Math.random().toString(36).substr(2, 2).toUpperCase();
+    id = 'O' + Date.now().toString().slice(-10) + rand;
+    attempts++;
+  } while (existingIds.has(id) && attempts < 10);
+  return id;
+}
 function getGameName(gid) { const g = DB.games.find(x => x.id === gid); return g ? g.name : ''; }
 function getGame(gid) { return DB.games.find(x => x.id === gid); }
 function getBooster(bid) { return DB.boosters.find(x => x.id === bid); }
@@ -4068,8 +4236,8 @@ function submitOrder() {
   const realPay = total - discount;
   
   const order = {
-    id: 'O' + Date.now().toString().slice(-10),
-    orderNo: 'O' + Date.now().toString().slice(-10),
+    id: genOrderId(),
+    orderNo: genOrderId(),
     userId: DB.currentUser.id,
     userName: DB.currentUser.nickname,
     boosterId: '',          // 抢单模式：下单时不指定护航师，由打手抢单后绑定
@@ -4195,6 +4363,10 @@ function markQrPaid() {
     DB.orders.push(order);
   }
   
+  // 【关键】立即保存到 localStorage，防止页面刷新或跳转丢失
+  // 注意：saveData 默认会触发云端同步，但我们下面会单独 forceSyncOrder 立即同步
+  saveData();
+  
   // 支付记录
   DB.paymentRecords.push({
     id: 'pay_' + Date.now(),
@@ -4205,6 +4377,7 @@ function markQrPaid() {
     status: 'pendingConfirm',
     createTime: Date.now()
   });
+  // 支付记录也立即保存一次
   saveData();
   
   // 立即同步到云端（不等待防抖）
@@ -4434,7 +4607,44 @@ function renderOrderActions(o, unread = 0) {
 
 function renderOrderDetail() {
   const o = DB.orders.find(x => x.id === STATE.selectedOrderId);
-  if (!o) return '<div class="empty">订单不存在</div>';
+  // 找不到订单时：如果云端已连接，显示加载中并后台从云端拉取该订单
+  if (!o) {
+    if (SUPABASE_ENABLED && supabaseClient && STATE.selectedOrderId) {
+      // 启动单次拉取（只拉一次，避免死循环）
+      if (!STATE._orderDetailRetryDone) {
+        STATE._orderDetailRetryDone = true;
+        fetchOrderFromCloud(STATE.selectedOrderId).then(found => {
+          if (found) {
+            render();
+          } else {
+            // 云端也没有，标记为确认不存在
+            STATE._orderDetailNotFound = true;
+            render();
+          }
+        });
+      }
+      if (STATE._orderDetailNotFound) {
+        return `
+          <div class="empty">
+            <div style="font-size:40px;margin-bottom:12px">📋</div>
+            <div style="font-size:14px;color:var(--text-2);margin-bottom:8px">订单不存在</div>
+            <div style="font-size:12px;color:var(--text-3)">订单号：${STATE.selectedOrderId || ''}</div>
+          </div>`;
+      }
+      return `
+        <div class="empty">
+          <div class="loading-spinner" style="margin-bottom:12px"></div>
+          <div style="font-size:14px;color:var(--text-2)">订单加载中...</div>
+          <div style="font-size:12px;color:var(--text-3);margin-top:4px">正在从云端同步订单数据</div>
+        </div>`;
+    }
+    return '<div class="empty">订单不存在</div>';
+  }
+  // 找到订单，重置重试标记
+  if (STATE._orderDetailRetryDone) {
+    STATE._orderDetailRetryDone = false;
+    STATE._orderDetailNotFound = false;
+  }
   
   const steps = [
     { k:'paid', label:'已支付', done: !!o.payTime },
@@ -9027,6 +9237,8 @@ function renderAdminSettings() {
           <button class="btn btn-outline btn-sm" onclick="pushToSupabaseManual()">推送本地</button>
           <button class="btn btn-outline btn-sm" onclick="loadCloudStats()">云端数据量</button>
           <button class="btn btn-outline btn-sm" onclick="retryFailedTables()">重试失败表</button>
+          <button class="btn btn-outline btn-sm" onclick="restoreLocalOrdersManual()" style="border-color:#f59e0b;color:#f59e0b">恢复订单备份</button>
+          <button class="btn btn-outline btn-sm" onclick="forceFullSyncFromCloud()" style="border-color:#10b981;color:#10b981">强制全量同步</button>
         </div>
         
         <!-- 同步日志 -->
@@ -9371,6 +9583,39 @@ function clearLocalCache() {
   } catch (e) {
     toast('清除失败：' + e.message);
   }
+}
+
+/** 手动从备份恢复本地订单（系统设置页调用） */
+async function restoreLocalOrdersManual() {
+  if (!confirm('确定要从最近一次同步前的备份恢复订单吗？\n恢复后当前未同步到云端的订单变更会丢失。')) return;
+  const count = restoreLocalOrders();
+  if (count === false) {
+    toast('没有找到备份');
+  } else {
+    toast(`已恢复 ${count} 条订单`);
+    addSyncLog('info', 'orders', 'restore', `手动恢复订单备份，共 ${count} 条`);
+    render();
+  }
+}
+
+/** 强制从云端全量同步（清空本地后重新拉取，慎用） */
+async function forceFullSyncFromCloud() {
+  if (!confirm('确定要强制从云端全量同步吗？\n本地独有的数据（尚未同步到云端）可能会丢失。\n建议先点「推送本地」确保数据都在云端。')) return;
+  if (!supabaseClient) { toast('Supabase 未连接'); return; }
+  toast('正在全量同步...');
+  // 先备份一份
+  backupLocalOrders();
+  const ok = await syncFromSupabase();
+  await syncOrderChatFromSupabase();
+  if (ok) {
+    toast('全量同步成功');
+  } else {
+    toast('部分表同步失败，查看日志');
+  }
+  // 重置订单详情重试状态，让详情页重新查找
+  STATE._orderDetailRetryDone = false;
+  STATE._orderDetailNotFound = false;
+  render();
 }
 
 async function loadCloudStats() {
