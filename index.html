@@ -41,6 +41,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei
 .topbar .sync-status .sync-dot{width:6px;height:6px;border-radius:50%;background:var(--text-3)}
 .topbar .sync-status.sync-connected .sync-dot{background:#10b981}
 .topbar .sync-status.sync-connecting .sync-dot{background:#f59e0b;animation:pulse 1.2s infinite}
+.topbar .sync-status.sync-reconnecting .sync-dot{background:#f59e0b;animation:pulse 1.2s infinite}
 .topbar .sync-status.sync-failed{display:none}
 .topbar .sync-status.sync-offline{display:none}
 
@@ -283,6 +284,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei
 .admin-sync-indicator .sync-dot{width:8px;height:8px;border-radius:50%}
 .admin-sync-indicator.sync-connected .sync-dot{background:#10b981}
 .admin-sync-indicator.sync-connecting .sync-dot{background:#f59e0b;animation:pulse 1.2s infinite}
+.admin-sync-indicator.sync-reconnecting .sync-dot{background:#f59e0b;animation:pulse 1.2s infinite}
 .admin-sync-indicator.sync-failed .sync-dot{background:#ef4444}
 .admin-sync-indicator.sync-offline .sync-dot{background:#9ca3af}
 .admin-refresh-btn{padding:8px 12px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;font-size:12px;display:inline-flex;align-items:center;gap:6px;transition:all .2s}
@@ -435,9 +437,26 @@ let SUPABASE_LAST_SYNC = 0;
 let SUPABASE_POLL_TIMER = null;
 let SUPABASE_ORDERS_CHANNEL = null;
 let SUPABASE_CHAT_CHANNEL = null;
-let SUPABASE_STATUS = 'connecting'; // connecting | connected | failed | offline
+// 连接状态：connecting(初次连接) | connected(已连接) | reconnecting(断线重连中) | offline(离线)
+// 注意：不再使用 failed 状态，避免单次失败就让 UI 频繁跳动
+let SUPABASE_STATUS = 'connecting';
 let SUPABASE_LAST_ERROR = '';
 let SUPABASE_DEBUG = true;
+
+// ========== 连接稳定性防抖动 ==========
+// 连续失败计数：只有连续失败达到阈值才切 offline，避免单次网络抖动导致状态反复横跳
+let _consecutiveFailures = 0;
+const FAIL_THRESHOLD_OFFLINE = 3;       // 连续失败 3 次才切离线
+const SUCCESS_THRESHOLD_RECOVER = 2;    // 连续成功 2 次才切回已连接（离线→恢复时）
+let _consecutiveSuccesses = 0;
+// 是否正在 poll 循环中（避免同时跑多个同步）
+let _pollInProgress = false;
+// Realtime 频道是否已订阅（避免重复订阅）
+let _realtimeSubscribed = false;
+// poll 间隔（毫秒），连接稳定时 8s，重试时 15s
+const POLL_INTERVAL_NORMAL = 8000;
+const POLL_INTERVAL_RETRY = 15000;
+let _currentPollInterval = POLL_INTERVAL_NORMAL;
 
 // 每表同步状态：{ [table]: { status: 'success'|'failed'|'pending', error: '', count: 0, time: 0 } }
 let SYNC_TABLE_STATUS = {};
@@ -654,7 +673,8 @@ async function registerUser(nickname, password) {
   DB.users.push({
     id: userId, username: '', phone: '', password: password,
     nickname: nick, avatar: DB.currentUser.avatar,
-    vipLevel: '普通会员', balance: 0, status: 1
+    vipLevel: '普通会员', balance: 0, status: 1,
+    createdAt: Date.now()
   });
 
   localStorage.setItem(USER_ID_KEY, userId);
@@ -719,6 +739,10 @@ async function loginUser(nickname, password) {
         console.warn('[Auth] 登录查询失败:', error.message);
       } else if (data && data.length > 0) {
         const user = data[0];
+        // 检查账号是否被禁用（status=0 或 'disabled' 表示禁用）
+        if (user.status === 0 || user.status === 'disabled') {
+          return { success: false, message: '账号已被禁用，请联系客服' };
+        }
         if (user.password && user.password === password) {
           setupLoggedInUser(user);
           return { success: true, message: '登录成功', userId: user.id };
@@ -739,6 +763,10 @@ async function loginUser(nickname, password) {
       (u.phone && u.phone === account)
     );
     if (localUser && localUser.password === password) {
+      // 检查账号是否被禁用
+      if (localUser.status === 0 || localUser.status === 'disabled') {
+        return { success: false, message: '账号已被禁用，请联系客服' };
+      }
       AUTH_STATE.userId = localUser.id;
       AUTH_STATE.username = localUser.username || '';
       AUTH_STATE.nickname = localUser.nickname;
@@ -827,12 +855,12 @@ function logSupabase(level, tag, msg, data) {
 
 function setSupabaseStatus(status, errorMsg) {
   const prev = SUPABASE_STATUS;
+  // 防抖动：单次失败不直接切 offline / reconnecting，由调用方累计失败次数后再切换
   SUPABASE_STATUS = status;
   if (errorMsg) SUPABASE_LAST_ERROR = errorMsg;
-  if (status === 'connected') SUPABASE_ENABLED = true;
-  if (status === 'failed' || status === 'offline') {
-    // 注意：不直接关闭 SUPABASE_ENABLED，保留重试机会
+  if (status === 'connected') {
     SUPABASE_ENABLED = true;
+    _currentPollInterval = POLL_INTERVAL_NORMAL;
   }
   if (prev !== status) {
     logSupabase('info', 'status', `${prev} -> ${status}${errorMsg ? ' ('+errorMsg+')' : ''}`);
@@ -1704,7 +1732,7 @@ async function loadSupabaseInBackground() {
     setSupabaseStatus('offline', '无客户端');
     return;
   }
-  // 启动网络状态监听（断线重连）
+  // 启动网络状态监听（只做提示 + 加速恢复，不直接切状态）
   setupNetworkListeners();
   try {
     setSupabaseStatus('connecting');
@@ -1713,23 +1741,29 @@ async function loadSupabaseInBackground() {
       setSupabaseStatus('connected');
       logSupabase('info', 'sync', '全量同步完成');
       SUPABASE_LAST_SYNC = Date.now();
+      _consecutiveFailures = 0;
+      _consecutiveSuccesses = SUCCESS_THRESHOLD_RECOVER; // 初始化为已达阈值
       startPolling();
-      subscribeOrdersRealtime();
-      subscribeChatRealtime();
+      // Realtime 订阅（失败不影响主流程，有轮询兜底）
+      try { subscribeOrdersRealtime(); } catch (e) { logSupabase('warn', 'realtime', '订单订阅失败: ' + e.message); }
+      try { subscribeChatRealtime(); } catch (e) { logSupabase('warn', 'realtime', '聊天订阅失败: ' + e.message); }
       await ensureCurrentUser();
       // 重放离线队列
       flushOfflineQueue();
       render();
     } else {
-      setSupabaseStatus('failed', '同步失败');
-      // 不直接关闭 SUPABASE_ENABLED，保留写入和轮询重试机会
+      // 初次同步失败：标记为重连中，让轮询继续后台重试，不打断用户使用
+      setSupabaseStatus('reconnecting', '首次同步失败，后台重试中');
       SUPABASE_ENABLED = true;
+      _consecutiveFailures = 1;
       startPolling();
       logSupabase('warn', 'sync', '全量同步失败，继续使用本地数据，后台持续重试');
+      addSyncLog('warn', 'all', 'sync', '首次同步失败，后台持续重试中，本地数据可用');
     }
   } catch (e) {
-    setSupabaseStatus('failed', e.message);
+    setSupabaseStatus('reconnecting', e.message);
     SUPABASE_ENABLED = true;
+    _consecutiveFailures = 1;
     startPolling();
     logSupabase('error', 'sync', '加载云端数据异常: ' + e.message);
   }
@@ -1813,6 +1847,7 @@ const FIELD_MAP = {
   withdrawType: 'withdraw_type',
   balanceChange: 'balance_change',
   vipLevel: 'vip_level',
+  createdAt: 'created_at',
   openid: 'openid',
   platformName: 'platform_name',
   darkMode: 'dark_mode',
@@ -2634,13 +2669,17 @@ let _pendingAdminBadge = 0; // 管理后台新订单红点计数
 
 function startPolling() {
   if (SUPABASE_POLL_TIMER) return;
-  SUPABASE_POLL_TIMER = setInterval(async () => {
+  const tick = async () => {
     if (!SUPABASE_ENABLED || !supabaseClient) return;
+    // 防并发：上一轮还没跑完就跳过这次
+    if (_pollInProgress) return;
+    _pollInProgress = true;
     try {
       // --- 快查：先看最新订单的更新时间，无变更则跳过全量拉取 ---
       const fastCheck = await fastCheckOrdersChanged();
       if (fastCheck === false) {
-        // 无变化，不做全量同步，节省带宽
+        // 无变化，也算一次成功心跳
+        _onPollSuccess();
         return;
       }
 
@@ -2695,11 +2734,73 @@ function startPolling() {
       if (STATE.subPage === 'orderChatDetail') {
         setTimeout(scrollOrderChatBottom, 50);
       }
+
+      _onPollSuccess();
     } catch (e) {
-      // 静默失败，不影响用户使用
+      // 静默失败，累计失败次数，达到阈值才切离线
       logSupabase('warn', 'poll', '轮询异常: ' + (e.message || '未知'));
+      _onPollFailure(e.message || '轮询失败');
+    } finally {
+      _pollInProgress = false;
     }
-  }, 8000); // 每 8 秒拉取一次
+  };
+  // 首次立即执行一次，再按间隔循环
+  setTimeout(tick, 1000);
+  SUPABASE_POLL_TIMER = setInterval(tick, _currentPollInterval);
+}
+
+/** 轮询成功：累计成功次数，状态从 offline/reconnecting 恢复时需要连续成功 SUCCESS_THRESHOLD_RECOVER 次 */
+function _onPollSuccess() {
+  _consecutiveFailures = 0;
+  _consecutiveSuccesses++;
+  if (SUPABASE_STATUS === 'connected') return; // 已是正常状态，无需切换
+  // 离线/重连中 → 需要连续成功达到阈值才切回 connected，避免抖动
+  if (_consecutiveSuccesses >= SUCCESS_THRESHOLD_RECOVER) {
+    SUPABASE_LAST_SYNC = Date.now();
+    setSupabaseStatus('connected');
+    // 恢复正常轮询间隔
+    if (_currentPollInterval !== POLL_INTERVAL_NORMAL) {
+      _currentPollInterval = POLL_INTERVAL_NORMAL;
+      _resetPollInterval();
+    }
+    addSyncLog('info', 'all', 'network', '云端连接已恢复');
+    // 网络恢复后处理离线队列
+    processOfflineQueue();
+    render();
+  }
+}
+
+/** 轮询失败：累计失败次数，达到阈值才切 offline，避免单次抖动导致状态反复横跳 */
+function _onPollFailure(errorMsg) {
+  _consecutiveSuccesses = 0;
+  _consecutiveFailures++;
+  // 只有连续失败达到阈值才切离线
+  if (_consecutiveFailures >= FAIL_THRESHOLD_OFFLINE && SUPABASE_STATUS === 'connected') {
+    setSupabaseStatus('offline', errorMsg || '网络异常');
+    addSyncLog('warn', 'all', 'network', '连续 ' + _consecutiveFailures + ' 次同步失败，已切换到本地模式，恢复后自动重连');
+    // 降低轮询频率，减少服务器压力
+    if (_currentPollInterval !== POLL_INTERVAL_RETRY) {
+      _currentPollInterval = POLL_INTERVAL_RETRY;
+      _resetPollInterval();
+    }
+    render();
+  } else if (SUPABASE_STATUS === 'connecting' || SUPABASE_STATUS === 'reconnecting') {
+    // 初次/重连中失败，保持当前状态，不切 offline，让重试继续
+    // 失败次数多了自动拉长间隔
+    if (_consecutiveFailures > FAIL_THRESHOLD_OFFLINE && _currentPollInterval !== POLL_INTERVAL_RETRY) {
+      _currentPollInterval = POLL_INTERVAL_RETRY;
+      _resetPollInterval();
+    }
+  }
+}
+
+/** 按当前间隔重置轮询定时器（间隔变化时调用） */
+function _resetPollInterval() {
+  if (SUPABASE_POLL_TIMER) {
+    clearInterval(SUPABASE_POLL_TIMER);
+    SUPABASE_POLL_TIMER = null;
+  }
+  startPolling();
 }
 
 // ============ 网络状态监听与自动重连 ============
@@ -2714,25 +2815,40 @@ function getReconnectDelay(attempt) {
   return delay;
 }
 
-/** 监听浏览器网络状态变化，网络恢复时自动重连 */
+/** 监听浏览器网络状态变化，网络恢复时触发一次立即同步 */
 function setupNetworkListeners() {
   if (typeof window === 'undefined') return;
   window.addEventListener('online', () => {
     _networkOnline = true;
-    logSupabase('info', 'network', '网络已恢复，开始重连...');
-    addSyncLog('info', 'all', 'network', '网络已恢复，正在重连云端...');
-    // 网络恢复，立即重连 + 刷新离线队列
-    _reconnectAttempts = 0;
-    scheduleReconnect(500);
+    logSupabase('info', 'network', '网络 online 事件：立即尝试同步');
+    // 网络恢复：重置失败计数，立即做一次同步
+    _consecutiveFailures = 0;
+    if (SUPABASE_STATUS === 'offline') {
+      setSupabaseStatus('reconnecting', '网络恢复，正在重连...');
+      addSyncLog('info', 'all', 'network', '网络已恢复，正在重连云端...');
+      render();
+    }
+    // 立即触发一次轮询（不等下一个周期）
+    if (SUPABASE_POLL_TIMER && !_pollInProgress) {
+      // 通过清空计数 + 下一轮会立即检测到恢复
+      setTimeout(() => {
+        // 手动跑一次同步来加速恢复
+        if (supabaseClient && SUPABASE_ENABLED) {
+          syncFromSupabase().then(ok => {
+            if (ok) _onPollSuccess();
+            else _onPollFailure('手动同步失败');
+          }).catch(e => _onPollFailure(e.message));
+        }
+      }, 500);
+    }
     // 立即处理离线队列
-    scheduleOfflineRetry(1000);
+    scheduleOfflineRetry(1500);
   });
   window.addEventListener('offline', () => {
     _networkOnline = false;
-    logSupabase('warn', 'network', '网络断开');
-    setSupabaseStatus('offline', '网络断开');
-    addSyncLog('warn', 'all', 'network', '网络断开，当前为本地模式，数据将在恢复后自动同步');
-    render();
+    logSupabase('warn', 'network', '浏览器 offline 事件（仅作参考，不立即切离线）');
+    // 注意：浏览器的 offline 事件有时不可靠（如 DNS 短暂失败也会触发），
+    // 这里只打日志，不立即切状态，真正的离线由连续轮询失败判定
   });
 }
 
@@ -2774,18 +2890,22 @@ function scheduleReconnect(delay) {
   }, actualDelay);
 }
 
-/** 当保存到云端连续失败时触发断线重连流程 */
+/** 当保存到云端连续失败时，累计到失败计数器，由轮询/快查统一决定是否切离线 */
 function handleSyncFailure(table, error) {
-  // 如果错误是网络相关，启动重连流程
   const msg = (error || '').toString().toLowerCase();
   const isNetworkError = msg.includes('network') || msg.includes('timeout') || 
                          msg.includes('fetch') || msg.includes('econn') ||
                          msg.includes('enotfound') || msg.includes('offline') ||
                          msg.includes('failed to fetch') || msg.includes('abort');
-  if (isNetworkError && SUPABASE_STATUS !== 'offline') {
+  if (!isNetworkError) return; // 非网络错误（如权限、数据），不做状态切换
+  // 只累计失败计数，真正的状态切换由 _onPollFailure 统一处理
+  _consecutiveFailures++;
+  _consecutiveSuccesses = 0;
+  logSupabase('warn', 'sync', `写入失败（${table}）: ${error}，连续失败 ${_consecutiveFailures} 次`);
+  // 如果已经连续失败超过阈值但还没切 offline，再切一次（兜底）
+  if (_consecutiveFailures >= FAIL_THRESHOLD_OFFLINE && SUPABASE_STATUS === 'connected') {
     setSupabaseStatus('offline', error || '网络异常');
-    addSyncLog('warn', 'all', 'network', '网络异常，切换到本地模式，恢复后自动重连');
-    scheduleReconnect();
+    addSyncLog('warn', 'all', 'network', '连续写入失败，已切换到本地模式，恢复后自动重连');
     render();
   }
 }
@@ -3090,6 +3210,18 @@ function migrateData() {
       if (r.platformIncome === undefined && r.rate === undefined) {
         r.platformIncome = 0;
         r.rate = 20;
+      }
+    });
+  }
+  // 迁移：用户表补 createdAt 和 status（老用户数据兼容）
+  if (DB.users && DB.users.length > 0) {
+    DB.users.forEach((u, i) => {
+      if (u.createdAt === undefined || u.createdAt === null) {
+        // 按注册顺序倒推，越早的用户时间越早（保证有个大概值）
+        u.createdAt = Date.now() - (DB.users.length - i) * 86400000;
+      }
+      if (u.status === undefined || u.status === null) {
+        u.status = 1; // 1=正常，0=禁用
       }
     });
   }
@@ -3415,6 +3547,30 @@ function formatTimeShort(ts) {
 }
 function formatMoney(n) { return (n || 0).toFixed(2); }
 function genId(prefix) { return prefix + Date.now().toString(36) + Math.random().toString(36).substr(2,5); }
+
+/** 简单 HTML 转义，防止 XSS / 渲染错乱 */
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** 订单状态中文文本 */
+function orderStatusText(status) {
+  switch (status) {
+    case 'pending': return '待接单';
+    case 'ongoing': return '进行中';
+    case 'completed': return '已完成';
+    case 'cancelled': return '已取消';
+    case 'refunded': return '已退款';
+    case 'refunding': return '退款中';
+    default: return status || '未知';
+  }
+}
 
 /**
  * 生成唯一订单号
@@ -3981,8 +4137,9 @@ function getSyncStatusLabel() {
 /** 管理后台同步状态文字（详细，管理员需要知道状态） */
 function getAdminSyncLabel() {
   const map = {
-    'connecting': '同步中',
+    'connecting': '连接中',
     'connected': '已连接',
+    'reconnecting': '重连中',
     'failed': '同步异常',
     'offline': '离线'
   };
@@ -7855,45 +8012,247 @@ function forceComplete(orderId) {
   render();
 }
 
-// --- Users ---
+// --- Users（用户管理） ---
+let adminUserSearch = '';      // 搜索关键词
+let adminUserDetailId = null;  // 当前查看详情的用户 ID
+
+/** 统计单个用户的订单数和消费总额 */
+function _getUserStats(userId) {
+  if (!DB.orders) return { orderCount: 0, totalSpent: 0, hasOrdered: false };
+  const userOrders = DB.orders.filter(o => o.userId === userId);
+  // 仅统计已支付/已完成的订单作为消费总额
+  const paid = userOrders.filter(o => o.payStatus === 'paid' || o.status === 'completed' || o.status === 'ongoing');
+  const totalSpent = paid.reduce((sum, o) => sum + (o.realPay || o.price || 0), 0);
+  return {
+    orderCount: userOrders.length,
+    totalSpent: totalSpent,
+    hasOrdered: userOrders.length > 0
+  };
+}
+
 function renderAdminUsers() {
-  const users = [{ id: DB.currentUser.id, nickname: DB.currentUser.nickname, level: DB.currentUser.level, balance: DB.currentUser.balance, status: 'active' }];
+  if (adminUserDetailId) {
+    return _renderAdminUserDetail();
+  }
+  // 搜索过滤
+  let users = (DB.users || []).slice();
+  const kw = adminUserSearch.trim().toLowerCase();
+  if (kw) {
+    users = users.filter(u =>
+      (u.nickname || '').toLowerCase().includes(kw) ||
+      (u.username || '').toLowerCase().includes(kw) ||
+      (u.phone || '').toLowerCase().includes(kw) ||
+      (u.id || '').toLowerCase().includes(kw)
+    );
+  }
+  // 按注册时间倒序（新用户在前）
+  users.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+  // 统计
+  const totalUsers = (DB.users || []).length;
+  const activeUsers = (DB.users || []).filter(u => u.status !== 0 && u.status !== 'disabled').length;
+  const disabledUsers = totalUsers - activeUsers;
+
   return `
     <div>
+      <!-- 顶部统计 + 搜索 -->
+      <div style="display:flex;gap:12px;margin-bottom:14px;flex-wrap:wrap;align-items:center">
+        <div style="padding:10px 16px;background:var(--bg-card);border-radius:8px;flex:1;min-width:120px">
+          <div style="font-size:12px;color:var(--text-2)">总用户数</div>
+          <div style="font-size:22px;font-weight:700;color:var(--gold)">${totalUsers}</div>
+        </div>
+        <div style="padding:10px 16px;background:var(--bg-card);border-radius:8px;flex:1;min-width:120px">
+          <div style="font-size:12px;color:var(--text-2)">正常用户</div>
+          <div style="font-size:22px;font-weight:700;color:var(--success)">${activeUsers}</div>
+        </div>
+        <div style="padding:10px 16px;background:var(--bg-card);border-radius:8px;flex:1;min-width:120px">
+          <div style="font-size:12px;color:var(--text-2)">已禁用</div>
+          <div style="font-size:22px;font-weight:700;color:var(--danger)">${disabledUsers}</div>
+        </div>
+        <div style="flex:2;min-width:200px">
+          <input class="form-input" placeholder="搜索昵称/ID/手机号..." value="${escapeHtml(adminUserSearch)}"
+            oninput="adminUserSearch=this.value;adminUserDetailId=null;render()">
+        </div>
+      </div>
+
       <div style="overflow-x:auto">
         <table class="admin-table">
           <thead>
-            <tr><th>ID</th><th>昵称</th><th>等级</th><th>余额</th><th>状态</th><th>操作</th></tr>
+            <tr>
+              <th>昵称</th>
+              <th>等级</th>
+              <th>余额</th>
+              <th>注册时间</th>
+              <th>是否下单</th>
+              <th>订单数</th>
+              <th>累计消费</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
           </thead>
           <tbody>
-            ${users.map(u => `
-              <tr>
-                <td>${u.id}</td>
-                <td>${u.nickname}</td>
-                <td>${u.level}</td>
-                <td style="color:var(--gold)">¥${formatMoney(u.balance)}</td>
-                <td>${u.status==='active'?'<span style="color:var(--success)">正常</span>':'<span style="color:var(--danger)">已封禁</span>'}</td>
-                <td><button class="btn btn-sm btn-outline" onclick="adjustBalance('${u.id}')">余额调整</button> <button class="btn btn-sm btn-gray" onclick="toast('操作成功')">${u.status==='active'?'封禁':'解封'}</button></td>
-              </tr>`).join('')}
+            ${users.length === 0 ? `<tr><td colspan="9" style="text-align:center;color:var(--text-3);padding:30px">暂无用户</td></tr>` : users.map(u => {
+              const stats = _getUserStats(u.id);
+              const isDisabled = u.status === 0 || u.status === 'disabled';
+              return `
+                <tr>
+                  <td style="font-weight:500">${escapeHtml(u.nickname || '-')}</td>
+                  <td>${u.vipLevel || u.level || '普通会员'}</td>
+                  <td style="color:var(--gold);font-weight:600">¥${formatMoney(u.balance || 0)}</td>
+                  <td style="font-size:12px;color:var(--text-2)">${u.createdAt ? formatTime(u.createdAt) : '-'}</td>
+                  <td>${stats.hasOrdered ? '<span style="color:var(--success)">是</span>' : '<span style="color:var(--text-3)">否</span>'}</td>
+                  <td>${stats.orderCount}</td>
+                  <td style="color:var(--gold)">¥${formatMoney(stats.totalSpent)}</td>
+                  <td>${isDisabled ? '<span style="color:var(--danger)">已禁用</span>' : '<span style="color:var(--success)">正常</span>'}</td>
+                  <td>
+                    <button class="btn btn-sm btn-outline" onclick="adminUserDetailId='${u.id}';render()">详情</button>
+                    <button class="btn btn-sm btn-outline" onclick="adjustUserBalance('${u.id}')">调余额</button>
+                    <button class="btn btn-sm ${isDisabled?'btn-outline':'btn-gray'}" onclick="toggleUserStatus('${u.id}')">${isDisabled?'启用':'禁用'}</button>
+                    <button class="btn btn-sm danger-text" style="background:transparent;border:none;cursor:pointer" onclick="deleteUser('${u.id}')">删除</button>
+                  </td>
+                </tr>`;
+            }).join('')}
           </tbody>
         </table>
       </div>
     </div>`;
 }
 
-function adjustBalance(userId) {
-  const amount = prompt('请输入调整金额（正数增加，负数扣减）：', '0');
+/** 用户详情页：个人信息 + 订单列表 */
+function _renderAdminUserDetail() {
+  const u = (DB.users || []).find(x => x.id === adminUserDetailId);
+  if (!u) {
+    adminUserDetailId = null;
+    return renderAdminUsers();
+  }
+  const stats = _getUserStats(u.id);
+  const isDisabled = u.status === 0 || u.status === 'disabled';
+  // 该用户的订单（按时间倒序）
+  const userOrders = (DB.orders || [])
+    .filter(o => o.userId === u.id)
+    .sort((a, b) => (b.createTime || 0) - (a.createTime || 0))
+    .slice(0, 20); // 最近 20 单
+
+  return `
+    <div>
+      <div style="margin-bottom:14px">
+        <button class="btn btn-sm btn-outline" onclick="adminUserDetailId=null;render()">← 返回用户列表</button>
+      </div>
+      <!-- 基本信息卡片 -->
+      <div style="background:var(--bg-card);border-radius:12px;padding:20px;margin-bottom:16px;display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+        <div class="avatar lg" style="width:56px;height:56px;font-size:22px">${u.avatar || u.nickname?.charAt(0) || '用'}</div>
+        <div style="flex:1;min-width:200px">
+          <div style="font-size:18px;font-weight:700">${escapeHtml(u.nickname || '-')}</div>
+          <div style="font-size:12px;color:var(--text-3);margin-top:4px">ID: ${u.id}</div>
+        </div>
+        <div style="display:flex;gap:20px;flex-wrap:wrap;font-size:13px">
+          <div><div style="color:var(--text-3);font-size:11px">等级</div><div style="font-weight:600;margin-top:2px">${u.vipLevel || u.level || '普通会员'}</div></div>
+          <div><div style="color:var(--text-3);font-size:11px">余额</div><div style="font-weight:600;color:var(--gold);margin-top:2px">¥${formatMoney(u.balance || 0)}</div></div>
+          <div><div style="color:var(--text-3);font-size:11px">订单数</div><div style="font-weight:600;margin-top:2px">${stats.orderCount}</div></div>
+          <div><div style="color:var(--text-3);font-size:11px">累计消费</div><div style="font-weight:600;color:var(--gold);margin-top:2px">¥${formatMoney(stats.totalSpent)}</div></div>
+          <div><div style="color:var(--text-3);font-size:11px">状态</div><div style="font-weight:600;color:${isDisabled?'var(--danger)':'var(--success)'};margin-top:2px">${isDisabled?'已禁用':'正常'}</div></div>
+          <div><div style="color:var(--text-3);font-size:11px">注册时间</div><div style="font-weight:500;margin-top:2px;font-size:12px">${u.createdAt ? formatTime(u.createdAt) : '-'}</div></div>
+        </div>
+      </div>
+
+      <!-- 操作栏 -->
+      <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+        <button class="btn btn-sm btn-outline" onclick="adjustUserBalance('${u.id}')">调整余额</button>
+        <button class="btn btn-sm ${isDisabled?'btn-primary':'btn-gray'}" onclick="toggleUserStatus('${u.id}')">${isDisabled?'启用账号':'禁用账号'}</button>
+        <button class="btn btn-sm danger-text" style="background:transparent;border:none;cursor:pointer" onclick="deleteUser('${u.id}')">删除用户</button>
+      </div>
+
+      <!-- 最近订单 -->
+      <div style="background:var(--bg-card);border-radius:12px;padding:16px">
+        <div style="font-weight:600;margin-bottom:10px">最近订单（${userOrders.length} 条）</div>
+        ${userOrders.length === 0 ? '<div style="color:var(--text-3);text-align:center;padding:20px;font-size:13px">暂无订单</div>' : `
+          <div style="overflow-x:auto">
+            <table class="admin-table">
+              <thead>
+                <tr><th>订单号</th><th>商品</th><th>金额</th><th>状态</th><th>下单时间</th></tr>
+              </thead>
+              <tbody>
+                ${userOrders.map(o => `
+                  <tr>
+                    <td style="font-size:12px">${o.orderNo || o.id}</td>
+                    <td>${escapeHtml(o.productName || '-')}</td>
+                    <td style="color:var(--gold)">¥${formatMoney(o.realPay || o.price || 0)}</td>
+                    <td><span class="order-status ${o.status==='completed'?'completed':o.status==='pending'?'pending':o.status==='cancelled'?'refund':'ongoing'}">${orderStatusText(o.status)}</span></td>
+                    <td style="font-size:12px;color:var(--text-2)">${o.createTime ? formatTime(o.createTime) : '-'}</td>
+                  </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>`}
+      </div>
+    </div>`;
+}
+
+/** 调整用户余额 */
+function adjustUserBalance(userId) {
+  const u = (DB.users || []).find(x => x.id === userId);
+  if (!u) return toast('用户不存在');
+  const amount = prompt(`调整「${u.nickname}」的余额\n当前余额：¥${formatMoney(u.balance || 0)}\n请输入调整金额（正数增加，负数扣减）：`, '0');
   if (amount === null) return;
   const n = parseFloat(amount);
   if (isNaN(n)) return toast('金额无效');
-  DB.currentUser.balance += n;
+  u.balance = (u.balance || 0) + n;
+  // 如果是当前登录用户，同步更新 currentUser
+  if (DB.currentUser && DB.currentUser.id === userId) {
+    DB.currentUser.balance = u.balance;
+  }
+  // 记录流水
+  if (!DB.flowRecords) DB.flowRecords = [];
   DB.flowRecords.push({
-    id: genId('F'), type: n>0?'recharge':'consume', amount: Math.abs(n),
-    desc: `管理员${n>0?'充值':'扣减'}`, time: Date.now()
+    id: genId('F'), type: n > 0 ? 'recharge' : 'consume',
+    amount: Math.abs(n),
+    desc: `管理员${n > 0 ? '充值' : '扣减'}（用户：${u.nickname}）`,
+    time: Date.now(),
+    userId: userId
   });
   saveData();
-  toast('余额已调整');
+  toast(`余额已${n >= 0 ? '增加' : '扣减'} ¥${formatMoney(Math.abs(n))}`);
   render();
+}
+
+/** 原 adjustBalance 兼容（保留旧调用） */
+function adjustBalance(userId) {
+  return adjustUserBalance(userId || DB.currentUser.id);
+}
+
+/** 禁用 / 启用用户 */
+function toggleUserStatus(userId) {
+  const u = (DB.users || []).find(x => x.id === userId);
+  if (!u) return toast('用户不存在');
+  const isDisabled = u.status === 0 || u.status === 'disabled';
+  if (!isDisabled) {
+    if (!confirm(`确定要禁用用户「${u.nickname}」吗？\n禁用后该用户将无法登录和下单。`)) return;
+    u.status = 0;
+    toast('已禁用');
+  } else {
+    u.status = 1;
+    toast('已启用');
+  }
+  saveData();
+  render();
+}
+
+/** 删除用户 */
+function deleteUser(userId) {
+  const u = (DB.users || []).find(x => x.id === userId);
+  if (!u) return;
+  if (!confirm(`确定要删除用户「${u.nickname}」吗？\n此操作不可恢复，该用户的订单数据将保留。`)) return;
+  const idx = DB.users.findIndex(x => x.id === userId);
+  if (idx > -1) {
+    DB.users.splice(idx, 1);
+    enqueueDeletion('users', userId);
+    saveData();
+    toast('已删除');
+    // 如果正在查看详情，返回列表
+    if (adminUserDetailId === userId) {
+      adminUserDetailId = null;
+    }
+    render();
+  }
 }
 
 // --- Boosters ---
@@ -10149,6 +10508,7 @@ function getStatusColor() {
     case 'connected': return '#22c55e';
     case 'failed': return '#f59e0b'; // 部分失败用黄色（仍可降级使用）
     case 'connecting': return '#f59e0b';
+    case 'reconnecting': return '#f59e0b';
     case 'offline': return '#9ca3af';
     default: return '#9ca3af';
   }
@@ -10161,7 +10521,8 @@ function getStatusText() {
     case 'connected': return '已连接云端';
     case 'failed': return '同步异常（部分失败）';
     case 'connecting': return '连接中...';
-    case 'offline': return '离线';
+    case 'reconnecting': return '重连中...';
+    case 'offline': return '离线（本地可用）';
     default: return '未知';
   }
 }
