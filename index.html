@@ -686,7 +686,22 @@ async function registerUser(nickname, password) {
   AUTH_STATE.isLoggedIn = true;
   saveAuthState();
 
-  saveData(false);
+  saveData(false); // 先保存到本地 localStorage（不上云，因为会单独 forceSync）
+  
+  // 【关键】注册后立即把新用户写入云端（不等待防抖）
+  // 失败则进入离线队列，保证后续会自动重试
+  forceSyncUser({
+    id: userId,
+    nickname: nick,
+    avatar: DB.currentUser.avatar,
+    balance: 0,
+    vipLevel: '普通会员',
+    password: password,
+    status: 1,
+    createdAt: Date.now()
+  }).catch(e => {
+    logSupabase('warn', 'register', `新用户写入云端失败，将自动重试: ${e.message}`);
+  });
 
   return { success: true, message: '注册成功', userId };
 }
@@ -1970,21 +1985,31 @@ function isValidUUID(str) {
 }
 
 /**
+ * 使用 UUID 类型主键的表（id 列是 uuid 类型）
+ * 这些表里如果出现非 UUID 的 id，upsert 会报 "invalid input syntax for type uuid"，需要清洗。
+ * 其余表使用 TEXT 类型主键，id 可以是任意字符串（u_xxx、Oxxx、f_xxx 等），不能删。
+ */
+const UUID_ID_TABLES = new Set([]); // 当前项目所有表都用 TEXT 主键，不做 UUID 清洗
+
+/**
  * 清洗数据中的 id 字段：
- * - 如果 id 是合法 UUID → 保留（可正常 upsert）
- * - 如果 id 不是 UUID（如数字、自定义字符串）→ 删除 id，让数据库自动生成
- * - 同时删除可能是 UUID 类型但格式错误的字段
+ * - 仅对 UUID_ID_TABLES 中的表做 id 清洗（防止 UUID 类型列写入失败）
+ * - 其他表一律保留原始 id（项目主键都是自定义 TEXT，如 u_xxx、Oxxx、f_xxx）
+ * - 注意：**绝不能** 把业务主键 id 删掉，否则 upsert 会变成重复插入，
+ *   跨设备同步时查询回来的记录 id 也对不上本地，导致同步完全失效。
  * @param {Object|Array} data - 单行或多行数据
+ * @param {string} [table] - 表名，用于判断主键类型
  * @returns {Object|Array} 清洗后的数据
  */
-function sanitizeIds(data) {
+function sanitizeIds(data, table) {
   if (!data) return data;
+  // 不在 UUID 主键表里的，直接原样返回，不做任何 id 清洗
+  if (!table || !UUID_ID_TABLES.has(table)) return data;
   if (Array.isArray(data)) {
-    return data.map(sanitizeIds);
+    return data.map(item => sanitizeIds(item, table));
   }
   if (typeof data !== 'object') return data;
   const out = { ...data };
-  // 只处理主键 id，其他 _id 字段可能是外键（text 类型）不动
   if (out.id !== undefined && !isValidUUID(out.id)) {
     delete out.id;
   }
@@ -2345,6 +2370,26 @@ async function forceSyncOrder(order) {
   }
 }
 
+// ============ 单条用户强制写入（立即，不防抖） ============
+// 用于：注册新用户、用户资料变更后立即同步到云端，保证跨设备可见
+async function forceSyncUser(user) {
+  if (!supabaseClient || !SUPABASE_ENABLED) {
+    addToOfflineQueue('users', toSnake(user));
+    return false;
+  }
+  try {
+    const payload = toSnake(user);
+    const { error } = await supabaseClient.from('users').upsert(payload);
+    if (error) throw error;
+    logSupabase('info', 'user', `用户已同步: ${user.id} (${user.nickname || '-'})`);
+    return true;
+  } catch (e) {
+    logSupabase('error', 'user', `用户写入失败: ${e.message}`);
+    addToOfflineQueue('users', toSnake(user));
+    return false;
+  }
+}
+
 async function forceFetchPendingOrders() {
   if (!supabaseClient || !SUPABASE_ENABLED) return null;
   try {
@@ -2486,9 +2531,9 @@ async function saveToSupabase() {
       if (t.table === 'chat_messages' || t.table === 'order_chat_messages') return;
       const localData = DB[t.key];
       if (Array.isArray(localData) && localData.length > 0) {
-        // 字段名转 snake_case，并对 id 做安全清洗（非UUID格式的id会被移除，避免写入UUID列时报错）
+        // 字段名转 snake_case，并对 id 做安全清洗（仅 UUID 类型主键表才清洗，TEXT 主键表原样保留）
         let data = toSnake(localData);
-        data = sanitizeIds(data);
+        data = sanitizeIds(data, t.table);
         writeList.push({
           table: t.table,
           data: data
@@ -2508,7 +2553,7 @@ async function saveToSupabase() {
         }
       }
       let data = toSnake(flat);
-      data = sanitizeIds(data);
+      data = sanitizeIds(data, 'chat_messages');
       writeList.push({ table: 'chat_messages', data: data });
     }
     
@@ -2531,7 +2576,7 @@ async function saveToSupabase() {
           });
         }
       }
-      const data = sanitizeIds(flat);
+      const data = sanitizeIds(flat, 'order_chat_messages');
       writeList.push({ table: 'order_chat_messages', data: data });
     }
     
@@ -3444,17 +3489,41 @@ async function syncCurrentUserToSupabase() {
   if (!supabaseClient || !DB.currentUser) return;
   try {
     const u = DB.currentUser;
-    const payload = {
+    const userRecord = {
       id: u.id,
       nickname: u.nickname || '',
       avatar: u.avatar || '',
       balance: parseFloat(u.balance || 0),
-      vip_level: u.level || '普通会员',
-      status: 1
+      vipLevel: u.level || '普通会员',
+      status: 1,
+      username: u.username || '',
+      phone: u.phone || ''
     };
-    await supabaseClient.from('users').upsert(payload);
+    // 先同步到本地 DB.users（保证用户管理页能看到当前用户）
+    if (!DB.users) DB.users = [];
+    const existing = DB.users.find(x => x.id === u.id);
+    if (existing) {
+      Object.assign(existing, userRecord);
+    } else {
+      DB.users.push({ ...userRecord, createdAt: Date.now() });
+    }
+    // 写入云端
+    const { error } = await supabaseClient.from('users').upsert(toSnake(userRecord));
+    if (error) throw error;
   } catch (e) {
-    console.warn('[Supabase] user sync failed:', e.message);
+    logSupabase('warn', 'user', `当前用户同步失败: ${e.message}`);
+    // 失败则进入离线队列
+    const u = DB.currentUser;
+    if (u) {
+      addToOfflineQueue('users', toSnake({
+        id: u.id,
+        nickname: u.nickname || '',
+        avatar: u.avatar || '',
+        balance: parseFloat(u.balance || 0),
+        vipLevel: u.level || '普通会员',
+        status: 1
+      }));
+    }
   }
 }
 
@@ -8210,6 +8279,8 @@ function adjustUserBalance(userId) {
     userId: userId
   });
   saveData();
+  // 立即同步到云端（跨设备可见）
+  forceSyncUser(u).catch(() => {});
   toast(`余额已${n >= 0 ? '增加' : '扣减'} ¥${formatMoney(Math.abs(n))}`);
   render();
 }
@@ -8233,10 +8304,10 @@ function toggleUserStatus(userId) {
     toast('已启用');
   }
   saveData();
+  // 立即同步到云端（跨设备立即生效）
+  forceSyncUser(u).catch(() => {});
   render();
 }
-
-/** 删除用户 */
 function deleteUser(userId) {
   const u = (DB.users || []).find(x => x.id === userId);
   if (!u) return;
@@ -8246,6 +8317,12 @@ function deleteUser(userId) {
     DB.users.splice(idx, 1);
     enqueueDeletion('users', userId);
     saveData();
+    // 立即推送到云端删除（不等待防抖），跨设备尽快同步
+    if (supabaseClient && SUPABASE_ENABLED) {
+      supabaseClient.from('users').delete().eq('id', userId).catch(e => {
+        logSupabase('warn', 'user', `删除用户云端同步失败: ${e.message}`);
+      });
+    }
     toast('已删除');
     // 如果正在查看详情，返回列表
     if (adminUserDetailId === userId) {
@@ -10777,24 +10854,129 @@ async function loadCloudStats() {
   const el = document.getElementById('cloudStats');
   if (!el) return;
   if (!supabaseClient) { el.innerHTML = '<span style="color:var(--text-3)">Supabase 未连接</span>'; return; }
+  el.innerHTML = '<span style="color:#60a5fa">正在读取云端数据量...</span>';
   try {
     const tables = ['orders', 'users', 'boosters', 'products', 'payments', 'withdrawals'];
     const results = await Promise.all(tables.map(t => 
-      supabaseClient.from(t).select('id', { count: 'exact', head: true })
+      withTimeout(supabaseClient.from(t).select('id', { count: 'exact', head: true }), 10000)
+        .then(r => ({ ...r, table: t }))
+        .catch(e => ({ error: { message: e.message }, table: t }))
     ));
     const labels = { orders: '订单', users: '用户', boosters: '护航师', products: '商品', payments: '支付记录', withdrawals: '提现记录' };
-    let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">';
-    results.forEach((r, i) => {
-      const t = tables[i];
-      const count = r.error ? '读取失败' : (r.count ?? 0);
-      const color = r.error ? 'color:#ef4444' : 'color:var(--text-1);font-weight:600';
-      html += `<div><span style="color:var(--text-3)">${labels[t]}：</span><span style="${color}">${count}</span></div>`;
+    const localKeys = { orders: 'orders', users: 'users', boosters: 'boosters', products: 'products', payments: 'paymentRecords', withdrawals: 'withdrawals' };
+    let html = '<div style="margin-bottom:8px;font-weight:500;font-size:12px">云端 vs 本地数据量对比</div>';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:12px">';
+    html += '<div style="color:var(--text-3)">表名</div><div style="color:var(--text-3);text-align:right">云端</div><div style="color:var(--text-3);text-align:right">本地</div>';
+    results.forEach(r => {
+      const t = r.table;
+      const cloudCount = r.error ? '❌' : (r.count ?? 0);
+      const localCount = (DB[localKeys[t]] || []).length;
+      const cloudColor = r.error ? 'color:#ef4444' : 'color:var(--gold);font-weight:600';
+      const localColor = 'color:var(--text-1)';
+      const errTip = r.error ? ` title="${r.error.message || ''}"` : '';
+      html += `<div>${labels[t]}</div><div style="text-align:right;${cloudColor}"${errTip}>${cloudCount}</div><div style="text-align:right;${localColor}">${localCount}</div>`;
     });
     html += '</div>';
+    // 一键测试写入按钮
+    html += `<div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+      <button class="btn btn-sm" style="background:#10b981;color:#fff;border:none;cursor:pointer" onclick="testCloudWrite()">一键测试写入</button>
+      <span id="cloudTestResult" style="font-size:11px;color:var(--text-3)">点击向云端写入一条测试数据，验证写入链路</span>
+    </div>`;
     el.innerHTML = html;
   } catch (e) {
     el.innerHTML = `<span style="color:#ef4444">读取失败：${e.message}</span>`;
   }
+}
+
+/**
+ * 一键测试云端写入链路
+ * - 向 users 和 orders 表各写入一条测试记录
+ * - 显示成功/失败和具体错误信息
+ * - 测试完成后自动删除测试数据
+ */
+async function testCloudWrite() {
+  const el = document.getElementById('cloudTestResult');
+  if (!el) return;
+  if (!supabaseClient) { el.textContent = 'Supabase 未连接'; el.style.color = '#ef4444'; return; }
+  el.textContent = '正在测试...';
+  el.style.color = '#60a5fa';
+
+  const testUserId = 'test_' + Date.now().toString(36);
+  const testOrderId = 'T' + Date.now().toString(36).toUpperCase();
+  const logs = [];
+
+  // 1. 测试写入 users
+  try {
+    const { error } = await withTimeout(
+      supabaseClient.from('users').upsert({
+        id: testUserId,
+        nickname: '云端写入测试',
+        balance: 0,
+        vip_level: '普通会员',
+        status: 1,
+        created_at: new Date().toISOString()
+      }),
+      8000
+    );
+    if (error) throw error;
+    logs.push('✅ users 表写入成功');
+  } catch (e) {
+    logs.push('❌ users 表写入失败: ' + (e.message || e));
+  }
+
+  // 2. 测试写入 orders
+  try {
+    const { error } = await withTimeout(
+      supabaseClient.from('orders').upsert({
+        id: testOrderId,
+        user_id: testUserId,
+        product_name: '云端写入测试订单',
+        total_amount: 0,
+        status: 'pending',
+        pay_status: 'unpaid',
+        create_time: new Date().toISOString()
+      }),
+      8000
+    );
+    if (error) throw error;
+    logs.push('✅ orders 表写入成功');
+  } catch (e) {
+    logs.push('❌ orders 表写入失败: ' + (e.message || e));
+  }
+
+  // 3. 测试查询（读回）
+  try {
+    const { data, error } = await withTimeout(
+      supabaseClient.from('users').select('id').eq('id', testUserId).limit(1),
+      8000
+    );
+    if (error) throw error;
+    if (data && data.length > 0) {
+      logs.push('✅ 读回测试成功（写入后可查询到）');
+    } else {
+      logs.push('⚠️ 读回测试失败（写入但查不到，可能有 RLS 策略过滤）');
+    }
+  } catch (e) {
+    logs.push('❌ 读回测试失败: ' + (e.message || e));
+  }
+
+  // 4. 清理测试数据（尽量删，失败不影响结果）
+  try {
+    await supabaseClient.from('orders').delete().eq('id', testOrderId);
+    await supabaseClient.from('users').delete().eq('id', testUserId);
+  } catch (e) {
+    logs.push('ℹ️ 测试数据清理失败（需手动删除）: ' + (e.message || e));
+  }
+
+  const allOk = logs.every(l => l.startsWith('✅'));
+  el.innerHTML = logs.map(l => {
+    let color = 'var(--text-2)';
+    if (l.startsWith('✅')) color = '#10b981';
+    else if (l.startsWith('❌')) color = '#ef4444';
+    else if (l.startsWith('⚠️')) color = '#f59e0b';
+    return `<div style="color:${color};font-size:11px;line-height:1.6">${l}</div>`;
+  }).join('');
+  el.style.color = allOk ? '#10b981' : '#ef4444';
 }
 
 async function changeAdminPwd() {
