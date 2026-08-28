@@ -3094,10 +3094,20 @@ function migrateData() {
     });
   }
   // 迁移：KG 俱乐部和平精英地铁逃生物品与热门订单
-  // - 仅在首次检测时注入，避免重复添加
-  if (!DB.settings._migratedKgClubV1) {
+  // - 版本化迁移：每次版本号提升都会重刷官方护航商品（删除旧的再注入新的），
+  //   确保价格表更新后老用户本地也能看到最新商品（不影响用户自建商品）
+  const KG_PRODUCTS_VERSION = 2;
+  if (DB.settings._migratedKgClubVersion !== KG_PRODUCTS_VERSION) {
+    // 删除旧的官方护航商品（按 boosterId 判断），避免重名/残留
+    if (DB.products) {
+      DB.products = DB.products.filter(p => p.boosterId !== KG_BOOSTER_ID);
+    }
+    // 删除旧的热门订单（按 productId 前缀判断）
+    if (DB.featuredOrders) {
+      DB.featuredOrders = DB.featuredOrders.filter(f => !f.productId || !f.productId.startsWith('p_kg_'));
+    }
     seedKGClubProducts();
-    DB.settings._migratedKgClubV1 = true;
+    DB.settings._migratedKgClubVersion = KG_PRODUCTS_VERSION;
   }
   saveData();
 }
@@ -3140,48 +3150,48 @@ function seedKGClubProducts() {
   // 30 个商品定义（type 字段用于分类展示）
   const productDefs = [
     // 分类1：新地图优惠
-    { name: '苏尔南地图 标配三保一', type: 'new_map', price: 45, unit: '单', desc: '新地图优惠，苏尔南地图标配三保一' },
+    { name: '新地图优惠-苏尔南地图标配三保一', type: 'new_map', price: 45, unit: '单', desc: '45r苏尔南地图标配三保一' },
     // 分类2：普通单
-    { name: '普通单 保底300w', type: 'normal', price: 15, unit: '单', desc: '保底300万' },
-    { name: '普通单 保底400w', type: 'normal', price: 20, unit: '单', desc: '保底400万' },
-    { name: '普通单 保底700w', type: 'normal', price: 35, unit: '单', desc: '保底700万' },
-    { name: '普通单 保底1000w', type: 'normal', price: 50, unit: '单', desc: '保底1000万' },
-    // 分类3：特惠单
-    { name: '特惠单 保底300-1000w', type: 'special', price: 9.9, unit: '单', desc: '每人一天只限一单，保底300-1000万' },
-    { name: '特惠单 保底400-1000w', type: 'special', price: 16.9, unit: '单', desc: '每人一天只限一单，保底400-1000万' },
-    { name: '特惠单 保底800-1000w', type: 'special', price: 29.9, unit: '单', desc: '每人一天只限一单，保底800-1000万' },
-    { name: '特惠单 保底1000-1500w', type: 'special', price: 40, unit: '单', desc: '每人一天只限一单，保底1000-1500万' },
+    { name: '普通单-保底300w', type: 'normal', price: 15, unit: '单', desc: '15保底300w' },
+    { name: '普通单-保底400w', type: 'normal', price: 20, unit: '单', desc: '20保底400w' },
+    { name: '普通单-保底700w', type: 'normal', price: 35, unit: '单', desc: '35保底700w' },
+    { name: '普通单-保底1000w', type: 'normal', price: 50, unit: '单', desc: '50保底1000w' },
+    // 分类3：特惠单（每人一天只限一单）
+    { name: '特惠单-保底300-1000w', type: 'special', price: 9.9, unit: '单', desc: '9.9保底300-1000w（每人一天只限一单）' },
+    { name: '特惠单-保底400-1000w', type: 'special', price: 16.9, unit: '单', desc: '16.9保底400-1000w（每人一天只限一单）' },
+    { name: '特惠单-保底800-1000w', type: 'special', price: 29.9, unit: '单', desc: '29.9保底800-1000w（每人一天只限一单）' },
+    { name: '特惠单-保底1000-1500w', type: 'special', price: 40, unit: '单', desc: '40保底1000-1500w（每人一天只限一单）' },
     // 分类4：挑战单
-    { name: '挑战单 苏尔南地图 标配三保一', type: 'challenge', price: 98, unit: '单', desc: '苏尔南地图标配三保一' },
-    { name: '挑战单 烽火荣都 保底666万', type: 'challenge', price: 30, unit: '单', desc: '烽火荣都地图，保底666万' },
-    { name: '挑战单 冰河禁区 保底666万', type: 'challenge', price: 27, unit: '单', desc: '冰河禁区地图，保底666万' },
+    { name: '挑战单-苏尔南地图标配三保一', type: 'challenge', price: 98, unit: '单', desc: '98苏尔南地图标配三保一' },
+    { name: '挑战单-烽火荣都保底666万', type: 'challenge', price: 30, unit: '单', desc: '30r烽火荣都保底666万' },
+    { name: '挑战单-冰河禁区保底666万', type: 'challenge', price: 27, unit: '单', desc: '27r冰河禁区保底666万' },
     // 分类5：技术单
-    { name: '技术陪 30分钟 无上限', type: 'tech', price: 30, unit: '30分钟', desc: '技术陪玩30分钟，一直打无上限' },
-    { name: '技术陪 60分钟 无上限', type: 'tech', price: 48, unit: '60分钟', desc: '技术陪玩60分钟，一直打无上限' },
+    { name: '技术单-技术陪30分钟', type: 'tech', price: 30, unit: '30分钟', desc: '30r技术陪30分钟一直打无上限' },
+    { name: '技术单-技术陪60分钟', type: 'tech', price: 48, unit: '60分钟', desc: '48r技术陪60分钟一直打无上限' },
     // 分类6：赌狗单
-    { name: '金龙单 不出保底3000w', type: 'gamble', price: 150, unit: '单', desc: '金龙单，不出保底3000万，不够继续补' },
-    { name: '尾刺单 不出保底4500w', type: 'gamble', price: 200, unit: '单', desc: '尾刺单，不出保底4500万，不够继续补' },
-    { name: '战镰单 不出保底7000w', type: 'gamble', price: 300, unit: '单', desc: '战镰单，不出保底7000万，不够继续补' },
+    { name: '赌狗单-金龙', type: 'gamble', price: 150, unit: '单', desc: '150金龙单（不出保底3000w）不够继续补' },
+    { name: '赌狗单-尾刺', type: 'gamble', price: 200, unit: '单', desc: '200尾刺（不出保底4500w）不够继续补' },
+    { name: '赌狗单-战镰', type: 'gamble', price: 300, unit: '单', desc: '300战镰（不出保底7000万）不够继续补' },
     // 分类7：赌金条（累计）
-    { name: '3金条 送200万保底', type: 'gold_cum', price: 20, unit: '单', desc: '累计3金条，送200万保底' },
-    { name: '6金条 送400万保底', type: 'gold_cum', price: 35, unit: '单', desc: '累计6金条，送400万保底' },
+    { name: '赌金条累计-3金条', type: 'gold_cum', price: 20, unit: '单', desc: '20r 3金条 送200万保底' },
+    { name: '赌金条累计-6金条', type: 'gold_cum', price: 35, unit: '单', desc: '35r 6金条 送400万保底' },
     // 分类8：赌金条（单局）
-    { name: '3金条 不出1588万保底', type: 'gold_single', price: 35, unit: '单', desc: '单局3金条，不出1588万保底' },
-    { name: '5金条 不出2500万保底', type: 'gold_single', price: 70, unit: '单', desc: '单局5金条，不出2500万保底' },
+    { name: '赌金条单局-3金条', type: 'gold_single', price: 35, unit: '单', desc: '35r 3金条（不出1588万保底）' },
+    { name: '赌金条单局-5金条', type: 'gold_single', price: 70, unit: '单', desc: '70r 5金条（不出2500万保底）' },
     // 分类9：赌光子鸡（累计）
-    { name: '1个光子鸡 不出保底800万', type: 'chicken_cum', price: 25, unit: '单', desc: '累计1个光子鸡，不出保底800万' },
-    { name: '2个光子鸡 不出保底1888万', type: 'chicken_cum', price: 38, unit: '单', desc: '累计2个光子鸡，不出保底1888万' },
-    { name: '3个光子鸡 不出保底2400万', type: 'chicken_cum', price: 65, unit: '单', desc: '累计3个光子鸡，不出保底2400万' },
+    { name: '赌光子鸡累计-1个', type: 'chicken_cum', price: 25, unit: '单', desc: '25一个光子鸡（不出保底800万）' },
+    { name: '赌光子鸡累计-2个', type: 'chicken_cum', price: 38, unit: '单', desc: '38两个光子鸡（不出保底1888万）' },
+    { name: '赌光子鸡累计-3个', type: 'chicken_cum', price: 65, unit: '单', desc: '65三个光子鸡（不出保底2400万）' },
     // 分类10：赌光子鸡（单局）
-    { name: '2个光子鸡 不出保底2888万', type: 'chicken_single', price: 69.9, unit: '单', desc: '单局2个光子鸡，不出保底2888万' },
+    { name: '赌光子鸡单局-2个', type: 'chicken_single', price: 69.9, unit: '单', desc: '69.9两个光子鸡（不出保底2888万）' },
     // 分类11：赌收益单
-    { name: '单局出300万', type: 'profit', price: 15.8, unit: '单', desc: '单局出300万，不够一直打' },
-    { name: '单局出500万', type: 'profit', price: 28.8, unit: '单', desc: '单局出500万，不够一直打' },
-    { name: '单局出700万', type: 'profit', price: 38.8, unit: '单', desc: '单局出700万，不够一直打' },
+    { name: '赌收益单-出300万', type: 'profit', price: 15.8, unit: '单', desc: '15.8r单局 出300万（不够一直打）' },
+    { name: '赌收益单-出500万', type: 'profit', price: 28.8, unit: '单', desc: '28.8r单局 出500万（不够一直打）' },
+    { name: '赌收益单-出700万', type: 'profit', price: 38.8, unit: '单', desc: '38.8r单局 出700万（不够一直打）' },
     // 分类12：豪华单
-    { name: '豪华单 保底5000万', type: 'luxury', price: 329, unit: '单', desc: '豪华单，保底5000万，不够一直打' },
+    { name: '豪华单-保底5000万', type: 'luxury', price: 329, unit: '单', desc: '329r 保底5000万（不够一直打）' },
     // 分类13：至尊单
-    { name: '至尊单 保底一个亿', type: 'supreme', price: 500, unit: '单', desc: '至尊单，保底一个亿，不够一直打' }
+    { name: '至尊单-保底一个亿', type: 'supreme', price: 500, unit: '单', desc: '500r 保底一个亿（不够一直打）' }
   ];
   if (!DB.products) DB.products = [];
   // 以名称+boosterId 去重，避免重复注入
@@ -3206,14 +3216,14 @@ function seedKGClubProducts() {
   // 首页热门订单：8 个有代表性的商品，按推荐度排序
   if (!DB.featuredOrders) DB.featuredOrders = [];
   const featuredTitles = [
-    '特惠单 保底300-1000w',
-    '普通单 保底300w',
-    '挑战单 烽火荣都 保底666万',
-    '技术陪 30分钟 无上限',
-    '苏尔南地图 标配三保一',
-    '金龙单 不出保底3000w',
-    '豪华单 保底5000万',
-    '至尊单 保底一个亿'
+    '特惠单-保底300-1000w',
+    '普通单-保底300w',
+    '挑战单-烽火荣都保底666万',
+    '技术单-技术陪30分钟',
+    '新地图优惠-苏尔南地图标配三保一',
+    '赌狗单-金龙',
+    '豪华单-保底5000万',
+    '至尊单-保底一个亿'
   ];
   const featuredSet = new Set(DB.featuredOrders.map(f => f.title));
   let orderIdx = 10;
