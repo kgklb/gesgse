@@ -1704,6 +1704,8 @@ async function loadSupabaseInBackground() {
     setSupabaseStatus('offline', '无客户端');
     return;
   }
+  // 启动网络状态监听（断线重连）
+  setupNetworkListeners();
   try {
     setSupabaseStatus('connecting');
     const ok = await syncFromSupabase();
@@ -1868,41 +1870,90 @@ function toCamel(obj) {
   return out;
 }
 
-// 将 settings 行转换为 DB.settings 对象
-function settingsRowToDB(row) {
-  if (!row) return null;
-  return {
-    platformName: row.platform_name || '护航电竞',
-    darkMode: row.dark_mode !== false,
-    notifications: row.notifications !== false,
-    voiceEnabled: row.voice_enabled !== false,
-    serviceQQ: row.service_qq || '',
-    serviceWechat: row.service_wechat || '',
-    commissionRates: row.commission_rates || { junior: 70, intermediate: 60, senior: 45, top: 10 },
-    quickReplies: row.quick_replies || [],
-    paymentQrWechat: row.payment_qr_wechat || '',
-    paymentQrAlipay: row.payment_qr_alipay || '',
-    featuredTitle: row.featured_title || '热门订单'
-  };
+// 将 settings 行（key-value 数组）转换为 DB.settings 对象
+// 云端 settings 表结构：id(uuid)、key(text unique)、value(jsonb)、updated_at(timestamptz)
+// 每一条配置存一行，通过 key 唯一标识，彻底避免 id 类型不匹配问题
+function settingsRowsToDB(rows) {
+  if (!rows || !Array.isArray(rows) || rows.length === 0) return null;
+  const result = {};
+  for (const row of rows) {
+    const key = row.key;
+    let value = row.value;
+    // 兼容 value 已经是对象 / 字符串 JSON 两种情况
+    if (typeof value === 'string') {
+      try { value = JSON.parse(value); } catch (e) { /* 已是原始字符串 */ }
+    }
+    result[key] = value;
+  }
+  return result;
 }
 
-function settingsDBToRow(s) {
-  return {
-    id: 1,
-    platform_name: s.platformName || '护航电竞',
-    dark_mode: s.darkMode !== false,
-    notifications: s.notifications !== false,
-    voice_enabled: s.voiceEnabled !== false,
-    service_qq: s.serviceQQ || '',
-    service_wechat: s.serviceWechat || '',
-    admin_password: DB.adminPassword || 'admin888',
-    commission_rates: s.commissionRates || { junior: 70, intermediate: 60, senior: 45, top: 10 },
-    quick_replies: s.quickReplies || [],
-    payment_qr_wechat: s.paymentQrWechat || '',
-    payment_qr_alipay: s.paymentQrAlipay || '',
-    featured_title: s.featuredTitle || '热门订单',
-    updated_at: new Date().toISOString()
-  };
+// 将 DB.settings 对象转换为 [{key, value, updated_at}] 数组
+// 不传 id 字段，让数据库自动生成 UUID，用 key 做 onConflict upsert
+function settingsDBToRows(s) {
+  if (!s || typeof s !== 'object') return [];
+  const now = new Date().toISOString();
+  const rows = [];
+  // 需要同步的设置项白名单（只同步运营配置，不同步本地偏好如 darkMode）
+  const syncKeys = [
+    'commissionRates',    // 抽成比例
+    'platformInfo',       // 平台信息（名称、客服等）
+    'platformName',       // 平台名称（独立字段）
+    'serviceQQ',          // 客服QQ
+    'serviceWechat',      // 客服微信
+    'paymentQrWechat',    // 微信收款码
+    'paymentQrAlipay',    // 支付宝收款码
+    'featuredTitle',      // 热门订单标题
+    'quickReplies',       // 快捷回复
+    'banners',            // 横幅公告
+    'announcements',      // 公告列表
+    'adminPassword',      // 管理员密码
+  ];
+  // 额外把整个 s 中的所有键都尝试同步，保证新增字段自动同步
+  const allKeys = [...new Set([...syncKeys, ...Object.keys(s)])];
+  for (const key of allKeys) {
+    if (!(key in s)) continue;
+    // 跳过纯本地偏好设置（不同步到云端）
+    if (['darkMode', 'notifications', 'voiceEnabled', 'lastReadAnnouncement'].includes(key)) continue;
+    const value = s[key];
+    rows.push({
+      key: key,
+      value: typeof value === 'string' ? value : JSON.stringify(value),
+      updated_at: now
+    });
+  }
+  return rows;
+}
+
+/**
+ * 判断字符串是否为合法 UUID 格式
+ * 用于推送前校验本地 id 是否能安全写入 UUID 类型列
+ */
+function isValidUUID(str) {
+  if (typeof str !== 'string') return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
+}
+
+/**
+ * 清洗数据中的 id 字段：
+ * - 如果 id 是合法 UUID → 保留（可正常 upsert）
+ * - 如果 id 不是 UUID（如数字、自定义字符串）→ 删除 id，让数据库自动生成
+ * - 同时删除可能是 UUID 类型但格式错误的字段
+ * @param {Object|Array} data - 单行或多行数据
+ * @returns {Object|Array} 清洗后的数据
+ */
+function sanitizeIds(data) {
+  if (!data) return data;
+  if (Array.isArray(data)) {
+    return data.map(sanitizeIds);
+  }
+  if (typeof data !== 'object') return data;
+  const out = { ...data };
+  // 只处理主键 id，其他 _id 字段可能是外键（text 类型）不动
+  if (out.id !== undefined && !isValidUUID(out.id)) {
+    delete out.id;
+  }
+  return out;
 }
 
 /**
@@ -2055,12 +2106,12 @@ async function syncFromSupabase() {
     // 同步前备份本地订单，防止同步异常导致数据丢失
     backupLocalOrders();
     
-    // 构建查询列表（与 TABLE_MAP 对应，跳过 settings 单独处理）
+    // 构建查询列表（跳过 settings（单独处理） 和 admins 表）
     const tablesToFetch = TABLE_MAP.filter(t => t.table !== 'settings' && t.table !== 'admins');
     
-    // settings 单独查（single）
+    // settings 单独查询（key-value 多行）
     const settingsPromise = withTimeout(
-      supabaseClient.from('settings').select('*').eq('id', 1).single(),
+      supabaseClient.from('settings').select('*'),
       10000
     ).then(r => ({ table: 'settings', result: r }))
      .catch(e => ({ table: 'settings', error: e }));
@@ -2081,10 +2132,19 @@ async function syncFromSupabase() {
     allResults.forEach(r => {
       if (r.error) {
         resultMap[r.table] = { error: r.error.message || r.error };
-        setTableSyncStatus(r.table, 'failed', r.error.message || r.error, 0);
+        // settings 表失败降级为本地模式，不算失败
+        if (r.table === 'settings') {
+          setTableSyncStatus(r.table, 'local', r.error.message || r.error, 0);
+        } else {
+          setTableSyncStatus(r.table, 'failed', r.error.message || r.error, 0);
+        }
       } else if (r.result?.error) {
         resultMap[r.table] = { error: r.result.error.message };
-        setTableSyncStatus(r.table, 'failed', r.result.error.message, 0);
+        if (r.table === 'settings') {
+          setTableSyncStatus(r.table, 'local', r.result.error.message, 0);
+        } else {
+          setTableSyncStatus(r.table, 'failed', r.result.error.message, 0);
+        }
       } else {
         const data = r.result.data;
         const count = Array.isArray(data) ? data.length : (data ? 1 : 0);
@@ -2094,10 +2154,23 @@ async function syncFromSupabase() {
     });
     
     // 应用到 DB
-    if (resultMap.settings?.data) {
-      DB.settings = settingsRowToDB(resultMap.settings.data);
-      if (resultMap.settings.data.admin_password) {
-        DB.adminPassword = resultMap.settings.data.admin_password;
+    // ---- settings 特殊处理：key-value 行 → 本地对象 ----
+    if (resultMap.settings?.data && Array.isArray(resultMap.settings.data)) {
+      const remoteSettings = settingsRowsToDB(resultMap.settings.data);
+      if (remoteSettings && Object.keys(remoteSettings).length > 0) {
+        // 合并策略：云端设置覆盖本地运营配置，但保留本地偏好（darkMode等）
+        const localPrefs = {
+          darkMode: DB.settings?.darkMode,
+          notifications: DB.settings?.notifications,
+          voiceEnabled: DB.settings?.voiceEnabled,
+          lastReadAnnouncement: DB.settings?.lastReadAnnouncement,
+        };
+        DB.settings = { ...DB.settings, ...remoteSettings, ...localPrefs };
+        // 单独处理 adminPassword
+        if (remoteSettings.adminPassword) {
+          DB.adminPassword = remoteSettings.adminPassword;
+        }
+        addSyncLog('info', 'settings', 'pull', `拉取 ${resultMap.settings.data.length} 项配置`);
       }
     }
     
@@ -2346,13 +2419,31 @@ async function saveToSupabase() {
   
   try {
     // ============ 1. 构建待写入的表数据 ============
-    const writeList = []; // [{ table, data }]
+    const writeList = []; // [{ table, data, onConflict? }]
     
-    // settings 单独处理
-    writeList.push({
-      table: 'settings',
-      data: settingsDBToRow(DB.settings)
-    });
+    // ---- settings 表：key-value 多行模式 ----
+    // 用 key 字段作为唯一标识做 upsert，不传 id，彻底解决 UUID 类型不匹配问题
+    // 每一个设置项存一行，便于增量更新和跨设备同步
+    const settingsRows = settingsDBToRows(DB.settings);
+    // 同时把 adminPassword 也同步进去（如果有）
+    if (DB.adminPassword) {
+      const now = new Date().toISOString();
+      // 检查是否已有 adminPassword 行，有则覆盖，无则追加
+      const existingIdx = settingsRows.findIndex(r => r.key === 'adminPassword');
+      if (existingIdx >= 0) {
+        settingsRows[existingIdx].value = DB.adminPassword;
+        settingsRows[existingIdx].updated_at = now;
+      } else {
+        settingsRows.push({ key: 'adminPassword', value: DB.adminPassword, updated_at: now });
+      }
+    }
+    if (settingsRows.length > 0) {
+      writeList.push({
+        table: 'settings',
+        data: settingsRows,
+        onConflict: 'key'  // 用 key 字段做 upsert，不是 id
+      });
+    }
     
     // 普通集合表（从 TABLE_MAP 取，过滤掉 settings / admins / chat_messages 特殊表）
     TABLE_MAP.forEach(t => {
@@ -2360,9 +2451,12 @@ async function saveToSupabase() {
       if (t.table === 'chat_messages' || t.table === 'order_chat_messages') return;
       const localData = DB[t.key];
       if (Array.isArray(localData) && localData.length > 0) {
+        // 字段名转 snake_case，并对 id 做安全清洗（非UUID格式的id会被移除，避免写入UUID列时报错）
+        let data = toSnake(localData);
+        data = sanitizeIds(data);
         writeList.push({
           table: t.table,
-          data: toSnake(localData)
+          data: data
         });
       } else if (Array.isArray(localData) && localData.length === 0) {
         // 空表也写一次，确保云端也为空（同步删除）
@@ -2378,7 +2472,9 @@ async function saveToSupabase() {
           arr.forEach(m => flat.push({ ...m, sessionId: sid }));
         }
       }
-      writeList.push({ table: 'chat_messages', data: toSnake(flat) });
+      let data = toSnake(flat);
+      data = sanitizeIds(data);
+      writeList.push({ table: 'chat_messages', data: data });
     }
     
     // order_chat_messages 展平
@@ -2400,30 +2496,34 @@ async function saveToSupabase() {
           });
         }
       }
-      writeList.push({ table: 'order_chat_messages', data: flat });
+      const data = sanitizeIds(flat);
+      writeList.push({ table: 'order_chat_messages', data: data });
     }
     
     totalTables = writeList.length;
     
     // ============ 2. 逐表执行 upsert，带超时+重试 ============
     for (const item of writeList) {
-      const { table, data } = item;
+      const { table, data, onConflict } = item;
       const count = Array.isArray(data) ? data.length : 1;
       
       try {
         await withRetry(async () => {
           let promise;
-          if (table === 'settings') {
-            // settings 是单记录 upsert，id 固定为 1，使用 onConflict 避免主键冲突
-            promise = supabaseClient.from('settings').upsert(data, { onConflict: 'id' });
-          } else if (Array.isArray(data) && data.length === 0) {
+          if (Array.isArray(data) && data.length === 0) {
             // 空数组 upsert 会报错，跳过（留待删除队列处理）
             return { data: [], error: null };
           } else if (Array.isArray(data) && data.length > 500) {
             // 数据量大时分批写入（每批 500 条）
-            return batchUpsert(table, data, 500);
+            return batchUpsert(table, data, 500, onConflict);
           } else {
-            promise = supabaseClient.from(table).upsert(data);
+            // 如果指定了 onConflict 字段（如 settings 的 key），用它做冲突处理
+            // 否则默认按主键 id upsert
+            if (onConflict) {
+              promise = supabaseClient.from(table).upsert(data, { onConflict: onConflict });
+            } else {
+              promise = supabaseClient.from(table).upsert(data);
+            }
           }
           
           const result = await withTimeout(promise, 20000);
@@ -2434,10 +2534,26 @@ async function saveToSupabase() {
         setTableSyncStatus(table, 'success', '', count);
         successCount++;
       } catch (e) {
-        hasError = true;
-        setTableSyncStatus(table, 'failed', e.message || '写入失败', 0);
-        addSyncLog('error', table, 'push', '写入失败：' + (e.message || e));
+        // settings 表如果云端不存在或结构不兼容，降级为本地模式（蓝色），不算失败
+        // 其他表正常记录失败
+        if (table === 'settings') {
+          setTableSyncStatus(table, 'local', e.message || '云端未初始化', count);
+          addSyncLog('warn', table, 'push', '云端settings表未初始化，使用本地模式：' + (e.message || e));
+        } else {
+          hasError = true;
+          setTableSyncStatus(table, 'failed', e.message || '写入失败', 0);
+          addSyncLog('error', table, 'push', '写入失败：' + (e.message || e));
+          // 检测是否为网络错误，是则触发断线重连流程
+          handleSyncFailure(table, e.message || e);
+          // 启动离线队列重试（指数退避）
+          scheduleOfflineRetry();
+        }
       }
+    }
+    
+    // 全部成功时重置离线重试计数
+    if (!hasError) {
+      _offlineRetryAttempts = 0;
     }
     
     // ============ 3. 处理删除队列 ============
@@ -2501,10 +2617,11 @@ async function saveToSupabase() {
  * @param {Array} data - 完整数据数组（已转 snake_case）
  * @param {number} batchSize - 每批条数
  */
-async function batchUpsert(table, data, batchSize = 500) {
+async function batchUpsert(table, data, batchSize = 500, onConflict = null) {
   for (let i = 0; i < data.length; i += batchSize) {
     const batch = data.slice(i, i + batchSize);
-    const result = await supabaseClient.from(table).upsert(batch);
+    const opts = onConflict ? { onConflict } : {};
+    const result = await supabaseClient.from(table).upsert(batch, opts);
     if (result?.error) throw new Error(`批次 ${Math.floor(i/batchSize)+1} 失败：${result.error.message}`);
   }
   return { data: [], error: null };
@@ -2583,6 +2700,123 @@ function startPolling() {
       logSupabase('warn', 'poll', '轮询异常: ' + (e.message || '未知'));
     }
   }, 8000); // 每 8 秒拉取一次
+}
+
+// ============ 网络状态监听与自动重连 ============
+let _networkOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+let _reconnectTimer = null;
+let _reconnectAttempts = 0;
+
+/** 指数退避时间（毫秒）：1s, 2s, 4s, 8s, 16s, 30s, 30s... */
+function getReconnectDelay(attempt) {
+  if (attempt <= 0) return 1000;
+  const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
+  return delay;
+}
+
+/** 监听浏览器网络状态变化，网络恢复时自动重连 */
+function setupNetworkListeners() {
+  if (typeof window === 'undefined') return;
+  window.addEventListener('online', () => {
+    _networkOnline = true;
+    logSupabase('info', 'network', '网络已恢复，开始重连...');
+    addSyncLog('info', 'all', 'network', '网络已恢复，正在重连云端...');
+    // 网络恢复，立即重连 + 刷新离线队列
+    _reconnectAttempts = 0;
+    scheduleReconnect(500);
+    // 立即处理离线队列
+    scheduleOfflineRetry(1000);
+  });
+  window.addEventListener('offline', () => {
+    _networkOnline = false;
+    logSupabase('warn', 'network', '网络断开');
+    setSupabaseStatus('offline', '网络断开');
+    addSyncLog('warn', 'all', 'network', '网络断开，当前为本地模式，数据将在恢复后自动同步');
+    render();
+  });
+}
+
+/** 调度一次重连尝试（指数退避） */
+function scheduleReconnect(delay) {
+  if (_reconnectTimer) return; // 已有定时器不重复创建
+  const actualDelay = delay != null ? delay : getReconnectDelay(_reconnectAttempts);
+  _reconnectTimer = setTimeout(async () => {
+    _reconnectTimer = null;
+    if (!_networkOnline) {
+      // 网络还没恢复，继续等
+      _reconnectAttempts++;
+      scheduleReconnect();
+      return;
+    }
+    try {
+      logSupabase('info', 'reconnect', `第 ${_reconnectAttempts + 1} 次重连尝试...`);
+      setSupabaseStatus('connecting');
+      const ok = initSupabase();
+      if (ok) {
+        logSupabase('info', 'reconnect', '重连成功');
+        setSupabaseStatus('connected');
+        _reconnectAttempts = 0;
+        // 重连成功：拉取云端数据 + 处理离线队列
+        await syncFromSupabase();
+        await syncOrderChatFromSupabase();
+        processOfflineQueue();
+        addSyncLog('info', 'all', 'network', '云端重连成功，数据已同步');
+        render();
+      } else {
+        throw new Error('初始化失败');
+      }
+    } catch (e) {
+      _reconnectAttempts++;
+      logSupabase('warn', 'reconnect', `重连失败: ${e.message}，${Math.round(getReconnectDelay(_reconnectAttempts)/1000)}s后重试`);
+      setSupabaseStatus('offline', e.message || '重连失败');
+      scheduleReconnect();
+    }
+  }, actualDelay);
+}
+
+/** 当保存到云端连续失败时触发断线重连流程 */
+function handleSyncFailure(table, error) {
+  // 如果错误是网络相关，启动重连流程
+  const msg = (error || '').toString().toLowerCase();
+  const isNetworkError = msg.includes('network') || msg.includes('timeout') || 
+                         msg.includes('fetch') || msg.includes('econn') ||
+                         msg.includes('enotfound') || msg.includes('offline') ||
+                         msg.includes('failed to fetch') || msg.includes('abort');
+  if (isNetworkError && SUPABASE_STATUS !== 'offline') {
+    setSupabaseStatus('offline', error || '网络异常');
+    addSyncLog('warn', 'all', 'network', '网络异常，切换到本地模式，恢复后自动重连');
+    scheduleReconnect();
+    render();
+  }
+}
+
+// ============ 离线队列增强：指数退避重试 ============
+let _offlineRetryTimer = null;
+let _offlineRetryAttempts = 0;
+
+/** 调度离线队列重试（指数退避） */
+function scheduleOfflineRetry(delay) {
+  if (_offlineRetryTimer) return;
+  const actualDelay = delay != null ? delay : Math.min(1000 * Math.pow(2, _offlineRetryAttempts), 30000);
+  _offlineRetryTimer = setTimeout(() => {
+    _offlineRetryTimer = null;
+    if (!_networkOnline || !supabaseClient) {
+      _offlineRetryAttempts++;
+      scheduleOfflineRetry();
+      return;
+    }
+    processOfflineQueue().then(remaining => {
+      if (remaining > 0) {
+        _offlineRetryAttempts++;
+        scheduleOfflineRetry();
+      } else {
+        _offlineRetryAttempts = 0;
+      }
+    }).catch(() => {
+      _offlineRetryAttempts++;
+      scheduleOfflineRetry();
+    });
+  }, actualDelay);
 }
 
 /**
@@ -9819,7 +10053,14 @@ async function runSyncDiagnosis() {
   } else {
     const successTables = allTables.filter(t => SYNC_TABLE_STATUS[t]?.status === 'success');
     const failedTables = allTables.filter(t => SYNC_TABLE_STATUS[t]?.status === 'failed');
+    const localTables = allTables.filter(t => SYNC_TABLE_STATUS[t]?.status === 'local');
     addLine(`  成功: ${successTables.length} 表`, '#22c55e');
+    if (localTables.length > 0) {
+      addLine(`  本地模式: ${localTables.length} 表（不影响使用）`, '#60a5fa');
+      localTables.forEach(t => {
+        addLine(`    • ${t}: ${SYNC_TABLE_STATUS[t]?.error || '云端未初始化'}`, '#60a5fa');
+      });
+    }
     if (failedTables.length > 0) {
       addLine(`  失败: ${failedTables.length} 表`, '#ef4444');
       failedTables.forEach(t => {
@@ -9875,7 +10116,8 @@ function getStatusText() {
 
 /** 成功/失败表计数徽章 */
 function getSuccessBadge() {
-  const tables = Object.keys(SYNC_TABLE_STATUS);
+  // 排除 local（本地模式）的表，它们不计入同步统计
+  const tables = Object.keys(SYNC_TABLE_STATUS).filter(t => SYNC_TABLE_STATUS[t]?.status !== 'local');
   if (tables.length === 0) return '';
   const success = tables.filter(t => SYNC_TABLE_STATUS[t]?.status === 'success').length;
   const failed = tables.length - success;
@@ -9910,6 +10152,16 @@ function renderTableSyncStatus() {
       return `<div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0">
         <span>${label}</span>
         <span style="color:var(--text-3)">未同步</span>
+      </div>`;
+    }
+    // local 状态：本地模式（settings 云端未初始化时降级）
+    if (st.status === 'local') {
+      return `<div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;gap:8px">
+        <span style="display:flex;align-items:center;gap:6px">
+          <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#60a5fa"></span>
+          <span style="color:var(--text-1)">${label}</span>
+        </span>
+        <span style="font-size:11px;color:#60a5fa">本地模式</span>
       </div>`;
     }
     const isOk = st.status === 'success';
