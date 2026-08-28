@@ -981,6 +981,7 @@ CREATE TABLE IF NOT EXISTS settings (
   quick_replies JSONB DEFAULT '[]'::jsonb,
   payment_qr_wechat TEXT DEFAULT '',     -- 微信收款码 base64
   payment_qr_alipay TEXT DEFAULT '',     -- 支付宝收款码 base64
+  featured_title TEXT DEFAULT '热门订单',  -- 首页热门订单标题
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 INSERT INTO settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
@@ -1232,8 +1233,11 @@ CREATE TABLE IF NOT EXISTS banners (
   sub_title TEXT DEFAULT '',
   link TEXT DEFAULT '',
   color TEXT DEFAULT 'from-purple-900 to-blue-900',
+  color_from TEXT DEFAULT '#1a1a2e',
+  color_to TEXT DEFAULT '#2d1f3d',
   sort INTEGER DEFAULT 0,
-  status INTEGER DEFAULT 1
+  status INTEGER DEFAULT 1,
+  enabled BOOLEAN DEFAULT true
 );
 
 -- 首页热门订单表
@@ -1830,7 +1834,13 @@ const FIELD_MAP = {
   gameIds: 'game_ids',
   currentRank: 'current_rank',
   targetRank: 'target_rank',
-  reviewTime: 'review_time'
+  reviewTime: 'review_time',
+  // banners 横幅表字段
+  colorFrom: 'color_from',
+  colorTo: 'color_to',
+  subTitle: 'sub_title',
+  // settings 表附加字段
+  featuredTitle: 'featured_title'
 };
 
 const REVERSE_FIELD_MAP = {};
@@ -1871,7 +1881,8 @@ function settingsRowToDB(row) {
     commissionRates: row.commission_rates || { junior: 70, intermediate: 60, senior: 45, top: 10 },
     quickReplies: row.quick_replies || [],
     paymentQrWechat: row.payment_qr_wechat || '',
-    paymentQrAlipay: row.payment_qr_alipay || ''
+    paymentQrAlipay: row.payment_qr_alipay || '',
+    featuredTitle: row.featured_title || '热门订单'
   };
 }
 
@@ -1889,6 +1900,7 @@ function settingsDBToRow(s) {
     quick_replies: s.quickReplies || [],
     payment_qr_wechat: s.paymentQrWechat || '',
     payment_qr_alipay: s.paymentQrAlipay || '',
+    featured_title: s.featuredTitle || '热门订单',
     updated_at: new Date().toISOString()
   };
 }
@@ -2402,8 +2414,8 @@ async function saveToSupabase() {
         await withRetry(async () => {
           let promise;
           if (table === 'settings') {
-            // settings 是单记录 upsert
-            promise = supabaseClient.from('settings').upsert(data);
+            // settings 是单记录 upsert，id 固定为 1，使用 onConflict 避免主键冲突
+            promise = supabaseClient.from('settings').upsert(data, { onConflict: 'id' });
           } else if (Array.isArray(data) && data.length === 0) {
             // 空数组 upsert 会报错，跳过（留待删除队列处理）
             return { data: [], error: null };
@@ -9104,43 +9116,136 @@ function deleteCoupon(id) {
   toast('已删除');
   render();
 }
-function addBanner() {
-  const title = prompt('公告标题：', '新公告');
-  if (!title) return;
-  const sub = prompt('公告内容（副标题）：', '描述文字') || '';
-  const sort = parseInt(prompt('排序（数字越小越靠前）：', '1')) || 1;
-  const maxSort = DB.banners.reduce((m,b)=>Math.max(m, b.sort||0), 0);
-  DB.banners.push({ 
-    id: genId('bn'), 
-    title, 
-    sub: sub || '', 
-    colorFrom: '#1a1a2e',
-    colorTo: '#2d1f3d',
-    link: '',
-    enabled: true,
-    sort: sort > 0 ? sort : maxSort + 1
-  });
+// ============== 公告（Banner）表单状态 ==============
+// 防止重渲染清空输入，保存时从状态取值
+let BANNER_FORM_STATE = {
+  id: '',        // 空串表示新增
+  title: '',
+  sub: '',
+  sort: 1,
+  colorFrom: '#1a1a2e',
+  colorTo: '#2d1f3d',
+  enabled: true
+};
+
+/** 打开公告编辑弹窗（新增或编辑） */
+function openBannerModal(id) {
+  if (id) {
+    const b = DB.banners.find(x => x.id === id);
+    if (!b) return;
+    BANNER_FORM_STATE = {
+      id: b.id,
+      title: b.title || '',
+      sub: b.sub || '',
+      sort: b.sort || 0,
+      colorFrom: b.colorFrom || '#1a1a2e',
+      colorTo: b.colorTo || '#2d1f3d',
+      enabled: b.enabled !== false
+    };
+  } else {
+    const maxSort = DB.banners.reduce((m,b)=>Math.max(m, b.sort||0), 0);
+    BANNER_FORM_STATE = {
+      id: '',
+      title: '',
+      sub: '',
+      sort: maxSort + 1,
+      colorFrom: '#1a1a2e',
+      colorTo: '#2d1f3d',
+      enabled: true
+    };
+  }
+  const s = BANNER_FORM_STATE;
+  showModal(`
+    <div style="width:420px">
+      <div class="modal-header"><h4>${id?'编辑公告':'添加公告'}</h4><span class="modal-close" onclick="closeModal()">${ICONS.close}</span></div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label">公告标题</label>
+          <input class="form-input" id="bannerTitle" placeholder="请输入公告标题" value="${s.title}" oninput="BANNER_FORM_STATE.title=this.value">
+        </div>
+        <div class="form-group">
+          <label class="form-label">副标题 / 内容</label>
+          <input class="form-input" id="bannerSub" placeholder="请输入副标题内容" value="${s.sub}" oninput="BANNER_FORM_STATE.sub=this.value">
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">排序</label>
+            <input class="form-input" type="number" id="bannerSort" value="${s.sort}" oninput="BANNER_FORM_STATE.sort=parseInt(this.value)||0">
+          </div>
+          <div class="form-group">
+            <label class="form-label">状态</label>
+            <select class="form-select" id="bannerEnabled" onchange="BANNER_FORM_STATE.enabled=this.value==='true'">
+              <option value="true" ${s.enabled?'selected':''}>显示</option>
+              <option value="false" ${!s.enabled?'selected':''}>隐藏</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">左侧颜色</label>
+            <input class="form-input" id="bannerColorFrom" type="color" value="${s.colorFrom}" oninput="BANNER_FORM_STATE.colorFrom=this.value;var prev=document.getElementById('bannerPreview');if(prev)prev.style.background='linear-gradient(135deg,'+this.value+' 0%,'+BANNER_FORM_STATE.colorTo+' 100%)'">
+          </div>
+          <div class="form-group">
+            <label class="form-label">右侧颜色</label>
+            <input class="form-input" id="bannerColorTo" type="color" value="${s.colorTo}" oninput="BANNER_FORM_STATE.colorTo=this.value;var prev=document.getElementById('bannerPreview');if(prev)prev.style.background='linear-gradient(135deg,'+BANNER_FORM_STATE.colorFrom+' 0%,'+this.value+' 100%)'">
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">预览</label>
+          <div id="bannerPreview" style="height:80px;border-radius:8px;background:linear-gradient(135deg,${s.colorFrom} 0%,${s.colorTo} 100%);display:flex;flex-direction:column;justify-content:center;padding:0 16px;color:#fff">
+            <div style="font-size:16px;font-weight:600">${s.title || '公告标题'}</div>
+            <div style="font-size:12px;opacity:0.8;margin-top:4px">${s.sub || '副标题内容'}</div>
+          </div>
+        </div>
+        <button class="btn btn-primary btn-block" onclick="saveBannerFromModal()">${id?'保存修改':'添加公告'}</button>
+      </div>
+    </div>`, { width: '420px', closeOnOverlay: true });
+}
+
+/** 从弹窗保存公告（新增或编辑） */
+function saveBannerFromModal() {
+  const s = BANNER_FORM_STATE;
+  const title = (s.title || '').trim();
+  if (!title) { toast('请输入公告标题'); return; }
+  
+  if (s.id) {
+    // 编辑
+    const b = DB.banners.find(x => x.id === s.id);
+    if (!b) return;
+    b.title = title;
+    b.sub = s.sub || '';
+    b.sort = parseInt(s.sort) || 0;
+    b.colorFrom = s.colorFrom || '#1a1a2e';
+    b.colorTo = s.colorTo || '#2d1f3d';
+    b.enabled = s.enabled !== false;
+  } else {
+    // 新增
+    DB.banners.push({
+      id: genId('bn'),
+      title: title,
+      sub: s.sub || '',
+      colorFrom: s.colorFrom || '#1a1a2e',
+      colorTo: s.colorTo || '#2d1f3d',
+      link: '',
+      enabled: s.enabled !== false,
+      sort: parseInt(s.sort) || 1
+    });
+  }
+  
   saveData();
-  toast('添加成功');
+  closeModal();
+  toast('公告已保存', 2500);
   render();
 }
 
-// 编辑公告
+// 添加公告（走自定义弹窗）
+function addBanner() {
+  openBannerModal();
+}
+
+// 编辑公告（走自定义弹窗）
 function editBanner(id) {
-  const b = DB.banners.find(x => x.id === id);
-  if (!b) return;
-  const title = prompt('公告标题：', b.title);
-  if (title === null) return;
-  const sub = prompt('公告内容（副标题）：', b.sub || '') ;
-  if (sub === null) return;
-  const sortStr = prompt('排序：', String(b.sort || 0));
-  if (sortStr === null) return;
-  b.title = title || b.title;
-  b.sub = sub;
-  b.sort = parseInt(sortStr) || 0;
-  saveData();
-  toast('保存成功');
-  render();
+  openBannerModal(id);
 }
 
 // 公告显示/隐藏切换
