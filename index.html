@@ -3094,10 +3094,15 @@ function migrateData() {
     });
   }
   // 迁移：KG 俱乐部和平精英地铁逃生物品与热门订单
-  // - 版本化迁移：每次版本号提升都会重刷官方护航商品（删除旧的再注入新的），
-  //   确保价格表更新后老用户本地也能看到最新商品（不影响用户自建商品）
-  const KG_PRODUCTS_VERSION = 2;
-  if (DB.settings._migratedKgClubVersion !== KG_PRODUCTS_VERSION) {
+  // - 双保险：版本号 + 商品数量检测，任何一个不满足都会重刷官方护航商品
+  //   （避免老用户本地标记已设但商品缺失 / 损坏时不再注入的问题）
+  // - 只删除/重建 boosterId === KG_BOOSTER_ID 的官方商品，绝不触碰用户自建商品
+  const KG_EXPECTED_COUNT = 30;
+  const kgProducts = (DB.products || []).filter(p => p.boosterId === KG_BOOSTER_ID);
+  const needRefresh =
+    DB.settings._migratedKgClubVersion !== KG_PRODUCTS_VERSION ||
+    kgProducts.length < KG_EXPECTED_COUNT;
+  if (needRefresh) {
     // 删除旧的官方护航商品（按 boosterId 判断），避免重名/残留
     if (DB.products) {
       DB.products = DB.products.filter(p => p.boosterId !== KG_BOOSTER_ID);
@@ -3113,6 +3118,16 @@ function migrateData() {
 }
 
 /**
+ * KG 俱乐部官方护航常量（全局，供迁移与后台工具函数共用）
+ * - GAME_ID: 和平精英
+ * - KG_BOOSTER_ID: 官方护航师「KG 俱乐部」
+ * - KG_PRODUCTS_VERSION: 价格表版本号，提升会触发老用户重刷
+ */
+const KG_GAME_ID = 'g2';
+const KG_BOOSTER_ID = 'b_kg_club';
+const KG_PRODUCTS_VERSION = 2;
+
+/**
  * KG 俱乐部和平精英地铁逃生物品种子数据
  * - 统一归属到一个官方护航师（KG俱乐部），gameId 指向和平精英
  * - 包含 30 个商品，分 13 类：新地图优惠 / 普通单 / 特惠单 / 挑战单 /
@@ -3121,18 +3136,16 @@ function migrateData() {
  */
 function seedKGClubProducts() {
   // 确保和平精英游戏存在
-  const GAME_ID = 'g2';
-  if (!DB.games.find(g => g.id === GAME_ID)) {
-    DB.games.push({ id: GAME_ID, name: '和平精英', icon: '和', color: '#4ecdc4' });
+  if (!DB.games.find(g => g.id === KG_GAME_ID)) {
+    DB.games.push({ id: KG_GAME_ID, name: '和平精英', icon: '和', color: '#4ecdc4' });
   }
   // 创建官方护航师「KG 俱乐部」（如果不存在）
-  const KG_BOOSTER_ID = 'b_kg_club';
   if (!DB.boosters.find(b => b.id === KG_BOOSTER_ID)) {
     DB.boosters.push({
       id: KG_BOOSTER_ID,
       nickname: 'KG俱乐部',
       avatar: 'KG',
-      gameId: GAME_ID,
+      gameId: KG_GAME_ID,
       rank: '无敌战神',
       level: 'senior',
       rating: 4.9,
@@ -3202,7 +3215,7 @@ function seedKGClubProducts() {
     DB.products.push({
       id: 'p_kg_' + (i + 1),
       boosterId: KG_BOOSTER_ID,
-      gameId: GAME_ID,
+      gameId: KG_GAME_ID,
       name: p.name,
       type: p.type,
       price: p.price,
@@ -8144,10 +8157,13 @@ function saveBoosterLevel(id) {
 // --- Products ---
 function renderAdminProducts() {
   const products = DB.products.slice().sort((a,b)=>a.sort-b.sort);
+  const kgCount = products.filter(p => p.boosterId === KG_BOOSTER_ID).length;
   return `
     <div>
-      <div style="margin-bottom:14px">
+      <div style="margin-bottom:14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary btn-sm" onclick="showProductForm()">${ICONS.plus} 添加商品</button>
+        <button class="btn btn-outline btn-sm" onclick="restoreKgProducts()" title="一键重新注入30个和平精英护航价格表商品（不影响自建商品）">${ICONS.refresh} 恢复默认护航商品</button>
+        <span style="font-size:12px;color:var(--text-3)">共 ${products.length} 个商品（官方护航 ${kgCount} 个）</span>
       </div>
       <div style="overflow-x:auto">
         <table class="admin-table">
@@ -8197,7 +8213,7 @@ function showProductForm(product) {
           <div class="form-group"><label class="form-label">价格</label><input class="form-input" type="number" id="pf_price" value="${p.price}"></div>
           <div class="form-group"><label class="form-label">单位</label><input class="form-input" id="pf_unit" value="${p.unit}"></div>
         </div>
-        <div class="form-group"><label class="form-label">描述</label><input class="form-input" id="pf_desc" value="${p.desc||''}"></div>
+        <div class="form-group"><label class="form-label">描述</label><textarea class="form-input" id="pf_desc" rows="3" style="resize:vertical;min-height:64px;font-family:inherit">${p.desc||''}</textarea></div>
         <div class="form-row">
           <div class="form-group"><label class="form-label">排序</label><input class="form-input" type="number" id="pf_sort" value="${p.sort||1}"></div>
           <div class="form-group"><label class="form-label">状态</label>
@@ -8293,6 +8309,32 @@ function addProductToFeatured(productId) {
   saveData();
   toast('已添加到首页热门订单');
   marketingTab = 'featured';
+  render();
+}
+
+/**
+ * 后台一键恢复官方护航默认商品（30个价格表商品）
+ * - 先删除所有 boosterId === KG_BOOSTER_ID 的旧官方商品及相关热门订单
+ * - 再重新注入最新的 30 个价格表商品 + 8 个热门推荐
+ * - 绝不触碰用户自建的商品（boosterId 不同）
+ */
+function restoreKgProducts() {
+  if (!confirm('确定要恢复默认护航商品吗？\n\n✓ 会删除并重建 KG 俱乐部的 30 个价格表商品\n✓ 不影响您自建的其他商品\n✓ 已被用户下单的订单数据不受影响')) return;
+  // 删旧官方商品
+  if (DB.products) {
+    DB.products = DB.products.filter(p => p.boosterId !== KG_BOOSTER_ID);
+  }
+  // 删旧热门订单（只删关联到官方商品的）
+  if (DB.featuredOrders) {
+    DB.featuredOrders = DB.featuredOrders.filter(f => !f.productId || !f.productId.startsWith('p_kg_'));
+  }
+  // 重新注入
+  seedKGClubProducts();
+  // 强制 bump 版本号，确保下次启动不再重复删建
+  DB.settings._migratedKgClubVersion = KG_PRODUCTS_VERSION;
+  saveData();
+  const count = (DB.products || []).filter(p => p.boosterId === KG_BOOSTER_ID).length;
+  toast('已恢复 ' + count + ' 个默认护航商品');
   render();
 }
 
