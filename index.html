@@ -1822,7 +1822,15 @@ const FIELD_MAP = {
   lastTime: 'last_time',
   boosterName: 'booster_name',
   sortOrder: 'sort_order',
-  productId: 'product_id'
+  productId: 'product_id',
+  // assessments 考核/入驻申请表字段
+  contactType: 'contact_type',
+  contactValue: 'contact_value',
+  rankText: 'rank_text',
+  gameIds: 'game_ids',
+  currentRank: 'current_rank',
+  targetRank: 'target_rank',
+  reviewTime: 'review_time'
 };
 
 const REVERSE_FIELD_MAP = {};
@@ -1945,6 +1953,54 @@ function mergeOrders(localOrders, remoteOrders, stats) {
 }
 
 /**
+ * 合并本地考核/入驻申请与云端申请（核心保护逻辑）
+ * 策略同 mergeOrders：本地独有保留、云端独有新增、两边都有以更新时间新的为准
+ * @param {Array} localList - 本地数据
+ * @param {Array} remoteList - 云端数据
+ * @param {Object} stats - 统计对象
+ * @returns {Array} 合并后数据
+ */
+function mergeAssessments(localList, remoteList, stats) {
+  const localMap = new Map();
+  (localList || []).forEach(o => localMap.set(o.id, o));
+  
+  const merged = [];
+  const usedLocalIds = new Set();
+  
+  remoteList.forEach(remote => {
+    const local = localMap.get(remote.id);
+    if (!local) {
+      merged.push(remote);
+      if (stats) stats.added++;
+    } else {
+      // 比较最后更新时间（审核时间或提交时间）
+      const localMax = Math.max(local.submitTime || 0, local.verifyTime || 0);
+      const remoteMax = Math.max(remote.submitTime || 0, remote.verifyTime || 0);
+      
+      if (remoteMax >= localMax) {
+        merged.push(remote);
+        if (stats && remoteMax > localMax) stats.updated++;
+        else if (stats) stats.unchanged++;
+      } else {
+        merged.push(local);
+        if (stats) stats.unchanged++;
+      }
+      usedLocalIds.add(remote.id);
+    }
+  });
+  
+  // 本地有、云端没有的 → 保留（新提交但尚未同步到云端的申请）
+  localList.forEach(local => {
+    if (!usedLocalIds.has(local.id)) {
+      merged.push(local);
+      if (stats) stats.localOnly++;
+    }
+  });
+  
+  return merged;
+}
+
+/**
  * 同步前备份本地订单数据（保护措施：如果同步后数据异常可恢复）
  * 仅备份 orders 表，存到 localStorage 独立 key
  */
@@ -2034,8 +2090,9 @@ async function syncFromSupabase() {
     }
     
     // 集合表（除 settings / chat_messages 特殊处理外）
-    // 注意：orders 表使用合并策略而非直接覆盖，防止本地新下单被云端旧数据覆盖丢失
+    // 注意：orders / assessments 表使用合并策略而非直接覆盖，防止本地新创建但尚未同步到云端的数据被覆盖丢失
     let orderStats = { added: 0, updated: 0, unchanged: 0, localOnly: 0 };
+    let assessStats = { added: 0, updated: 0, unchanged: 0, localOnly: 0 };
     TABLE_MAP.forEach(t => {
       if (t.table === 'settings' || t.table === 'admins') return;
       if (t.table === 'chat_messages') return; // 单独处理
@@ -2047,10 +2104,20 @@ async function syncFromSupabase() {
       if (t.table === 'orders') {
         const merged = mergeOrders(DB.orders || [], remoteData, orderStats);
         DB[t.key] = merged;
-        // 记录同步统计到日志
         if (orderStats.added > 0 || orderStats.updated > 0 || orderStats.localOnly > 0) {
           addSyncLog('info', 'orders', 'pull',
             `拉取 ${remoteData.length} 条，新增 ${orderStats.added}，更新 ${orderStats.updated}，保留本地 ${orderStats.localOnly} 条未上云订单`);
+        }
+        return;
+      }
+      
+      // assessments 表特殊处理：合并策略，保护本地新提交的考核/入驻申请
+      if (t.table === 'assessments') {
+        const merged = mergeAssessments(DB.assessments || [], remoteData, assessStats);
+        DB[t.key] = merged;
+        if (assessStats.added > 0 || assessStats.updated > 0 || assessStats.localOnly > 0) {
+          addSyncLog('info', 'assessments', 'pull',
+            `拉取 ${remoteData.length} 条，新增 ${assessStats.added}，更新 ${assessStats.updated}，保留本地 ${assessStats.localOnly} 条未上云申请`);
         }
         return;
       }
@@ -2176,6 +2243,35 @@ async function forceFetchPendingOrders() {
   } catch (e) {
     logSupabase('error', 'orders', `拉取待接单订单失败: ${e.message}`);
     return null;
+  }
+}
+
+/**
+ * 强制立即同步单条考核/入驻申请到云端
+ * - 提交考核/入驻申请后立即调用，保证后台能最快看到
+ * - 失败则进入离线队列自动重试
+ * @param {Object} record - assessments 表记录（camelCase）
+ */
+async function forceSyncAssessment(record) {
+  if (!supabaseClient || !SUPABASE_ENABLED) {
+    addToOfflineQueue('assessments', toSnake(record));
+    return false;
+  }
+  try {
+    const payload = toSnake(record);
+    const { error } = await withTimeout(
+      supabaseClient.from('assessments').upsert(payload),
+      10000
+    );
+    if (error) throw error;
+    logSupabase('info', 'assessments', `考核申请已同步: ${record.id}`);
+    setTableSyncStatus('assessments', 'success', '', DB.assessments.length);
+    return true;
+  } catch (e) {
+    logSupabase('error', 'assessments', `考核申请写入失败，进入离线队列: ${e.message}`);
+    setTableSyncStatus('assessments', 'failed', e.message || '写入失败', 0);
+    addToOfflineQueue('assessments', toSnake(record));
+    return false;
   }
 }
 
@@ -2321,7 +2417,7 @@ async function saveToSupabase() {
           const result = await withTimeout(promise, 20000);
           if (result?.error) throw new Error(result.error.message || 'upsert failed');
           return result;
-        }, 1, 1000);
+        }, 2, 1500); // 重试 2 次（共 3 次尝试），间隔 1.5 秒
         
         setTableSyncStatus(table, 'success', '', count);
         successCount++;
@@ -5211,19 +5307,19 @@ function openFeedbackForm() {
       <div class="modal-body">
         <div class="form-group">
           <label class="form-label">问题类型</label>
-          <select class="form-select" id="feedbackType">
-            <option value="功能异常">功能异常</option>
-            <option value="体验问题">体验问题</option>
-            <option value="其他">其他</option>
+          <select class="form-select" id="feedbackType" onchange="FEEDBACK_FORM_STATE.type=this.value">
+            <option value="功能异常" ${FEEDBACK_FORM_STATE.type==='功能异常'?'selected':''}>功能异常</option>
+            <option value="体验问题" ${FEEDBACK_FORM_STATE.type==='体验问题'?'selected':''}>体验问题</option>
+            <option value="其他" ${FEEDBACK_FORM_STATE.type==='其他'?'selected':''}>其他</option>
           </select>
         </div>
         <div class="form-group">
           <label class="form-label">问题描述</label>
-          <textarea class="form-textarea" id="feedbackContent" placeholder="请详细描述您遇到的问题" rows="4"></textarea>
+          <textarea class="form-textarea" id="feedbackContent" placeholder="请详细描述您遇到的问题" rows="4" oninput="FEEDBACK_FORM_STATE.content=this.value">${FEEDBACK_FORM_STATE.content}</textarea>
         </div>
         <div class="form-group">
           <label class="form-label">联系方式（可选）</label>
-          <input class="form-input" id="feedbackContact" placeholder="手机号或微信号，方便我们联系您">
+          <input class="form-input" id="feedbackContact" placeholder="手机号或微信号，方便我们联系您" value="${FEEDBACK_FORM_STATE.contact}" oninput="FEEDBACK_FORM_STATE.contact=this.value">
         </div>
         <div class="form-group">
           <label class="form-label">截图（可选）</label>
@@ -5253,9 +5349,10 @@ function onFeedbackImgChange(input) {
 }
 
 function submitFeedback() {
-  const type = document.getElementById('feedbackType')?.value || '功能异常';
-  const content = document.getElementById('feedbackContent')?.value.trim();
-  const contact = document.getElementById('feedbackContact')?.value.trim();
+  // 从表单状态取值（防止 DOM 重渲染导致值丢失）
+  const type = FEEDBACK_FORM_STATE.type || '功能异常';
+  const content = (FEEDBACK_FORM_STATE.content || '').trim();
+  const contact = (FEEDBACK_FORM_STATE.contact || '').trim();
   if (!content) { toast('请填写问题描述'); return; }
   
   const record = {
@@ -5279,6 +5376,8 @@ function submitFeedback() {
   }
   
   _feedbackImg = '';
+  // 清空表单状态
+  FEEDBACK_FORM_STATE = { type: '功能异常', content: '', contact: '' };
   closeModal();
   showModal(`
     <div class="success-modal">
@@ -5297,6 +5396,12 @@ function openReportForm() {
   myOrders.forEach(o => { boosterMap[o.boosterId] = o.boosterName; });
   const boosterOptions = Object.entries(boosterMap);
   
+  // 初始化默认选中的打手
+  if (boosterOptions.length > 0 && !REPORT_FORM_STATE.boosterId) {
+    REPORT_FORM_STATE.boosterId = boosterOptions[0][0];
+  }
+  const s = REPORT_FORM_STATE;
+  
   showModal(`
     <div>
       <div class="modal-header"><h4>举报打手</h4><span class="modal-close" onclick="closeModal()">${ICONS.close}</span></div>
@@ -5305,22 +5410,22 @@ function openReportForm() {
           <label class="form-label">选择被举报的打手</label>
           ${boosterOptions.length === 0 
             ? '<div style="font-size:12px;color:var(--text-3);padding:8px 0">暂无历史订单，无法举报</div>'
-            : `<select class="form-select" id="reportBooster">
-                ${boosterOptions.map(([id, name]) => `<option value="${id}">${name}</option>`).join('')}
+            : `<select class="form-select" id="reportBooster" onchange="REPORT_FORM_STATE.boosterId=this.value">
+                ${boosterOptions.map(([id, name]) => `<option value="${id}" ${s.boosterId===id?'selected':''}>${name}</option>`).join('')}
               </select>`}
         </div>
         <div class="form-group">
           <label class="form-label">举报原因</label>
-          <select class="form-select" id="reportReason">
-            <option value="服务态度差">服务态度差</option>
-            <option value="未按时完成">未按时完成</option>
-            <option value="辱骂用户">辱骂用户</option>
-            <option value="其他">其他</option>
+          <select class="form-select" id="reportReason" onchange="REPORT_FORM_STATE.reason=this.value">
+            <option value="服务态度差" ${s.reason==='服务态度差'?'selected':''}>服务态度差</option>
+            <option value="未按时完成" ${s.reason==='未按时完成'?'selected':''}>未按时完成</option>
+            <option value="辱骂用户" ${s.reason==='辱骂用户'?'selected':''}>辱骂用户</option>
+            <option value="其他" ${s.reason==='其他'?'selected':''}>其他</option>
           </select>
         </div>
         <div class="form-group">
           <label class="form-label">举报描述</label>
-          <textarea class="form-textarea" id="reportContent" placeholder="请详细描述举报内容" rows="4"></textarea>
+          <textarea class="form-textarea" id="reportContent" placeholder="请详细描述举报内容" rows="4" oninput="REPORT_FORM_STATE.content=this.value">${s.content}</textarea>
         </div>
         <div class="form-group">
           <label class="form-label">截图证据（可选）</label>
@@ -5350,9 +5455,10 @@ function onReportImgChange(input) {
 }
 
 function submitReport() {
-  const boosterId = document.getElementById('reportBooster')?.value;
-  const reason = document.getElementById('reportReason')?.value || '其他';
-  const content = document.getElementById('reportContent')?.value.trim();
+  // 从表单状态取值（防止 DOM 重渲染导致值丢失）
+  const boosterId = REPORT_FORM_STATE.boosterId;
+  const reason = REPORT_FORM_STATE.reason || '其他';
+  const content = (REPORT_FORM_STATE.content || '').trim();
   if (!boosterId) { toast('请选择被举报的打手'); return; }
   if (!content) { toast('请填写举报描述'); return; }
   
@@ -5380,6 +5486,8 @@ function submitReport() {
   }
   
   _reportImg = '';
+  // 清空表单状态
+  REPORT_FORM_STATE = { boosterId: '', reason: '服务态度差', content: '' };
   closeModal();
   showModal(`
     <div class="success-modal">
@@ -5543,6 +5651,12 @@ function renderAssessmentPage() {
   const hasApproved = records.some(r => r.status === 'approved');
   const current = records[records.length - 1];
   
+  // 首次进入时初始化默认游戏（若无选中项）
+  if (!ASSESS_FORM_STATE.gameId && DB.games.length > 0) {
+    ASSESS_FORM_STATE.gameId = DB.games[0].id;
+  }
+  const s = ASSESS_FORM_STATE;
+  
   return `
     <div class="page active">
       <div class="detail-section">
@@ -5563,31 +5677,31 @@ function renderAssessmentPage() {
         <h4>提交考核</h4>
         <div class="form-group">
           <label class="form-label">选择游戏</label>
-          <select class="form-select" id="assessGame">
-            ${DB.games.map(g=>`<option value="${g.id}">${g.name}</option>`).join('')}
+          <select class="form-select" id="assessGame" onchange="ASSESS_FORM_STATE.gameId=this.value">
+            ${DB.games.map(g=>`<option value="${g.id}" ${s.gameId===g.id?'selected':''}>${g.name}</option>`).join('')}
           </select>
         </div>
         <div class="form-group">
           <label class="form-label">游戏ID</label>
-          <input class="form-input" id="assessGameId" placeholder="请输入游戏ID">
+          <input class="form-input" id="assessGameId" placeholder="请输入游戏ID" value="${s.gameAccount}" oninput="ASSESS_FORM_STATE.gameAccount=this.value">
         </div>
         <div class="form-row">
           <div class="form-group">
             <label class="form-label">当前段位</label>
-            <input class="form-input" id="assessCurRank" placeholder="如：钻石">
+            <input class="form-input" id="assessCurRank" placeholder="如：钻石" value="${s.curRank}" oninput="ASSESS_FORM_STATE.curRank=this.value">
           </div>
           <div class="form-group">
             <label class="form-label">目标段位</label>
-            <input class="form-input" id="assessTargetRank" placeholder="如：王者">
+            <input class="form-input" id="assessTargetRank" placeholder="如：王者" value="${s.targetRank}" oninput="ASSESS_FORM_STATE.targetRank=this.value">
           </div>
         </div>
         <div class="form-group">
           <label class="form-label">联系方式</label>
-          <input class="form-input" id="assessContact" placeholder="请输入手机号或微信">
+          <input class="form-input" id="assessContact" placeholder="请输入手机号或微信" value="${s.contact}" oninput="ASSESS_FORM_STATE.contact=this.value">
         </div>
         <div class="form-group">
           <label class="form-label">上传凭证（截图Base64）</label>
-          <textarea class="form-textarea" id="assessProof" placeholder="粘贴base64图片数据，或直接填写截图描述" style="font-size:11px"></textarea>
+          <textarea class="form-textarea" id="assessProof" placeholder="粘贴base64图片数据，或直接填写截图描述" style="font-size:11px" oninput="ASSESS_FORM_STATE.proof=this.value">${s.proof}</textarea>
         </div>
         <button class="btn btn-primary btn-block" onclick="submitAssessment()">提交考核</button>
       </div>` : ''}
@@ -5608,19 +5722,21 @@ function renderAssessmentPage() {
 }
 
 function submitAssessment() {
-  const gameId = document.getElementById('assessGame').value;
-  const gameAccount = document.getElementById('assessGameId').value;
-  const curRank = document.getElementById('assessCurRank').value;
-  const targetRank = document.getElementById('assessTargetRank').value;
-  const contact = document.getElementById('assessContact').value;
-  const proof = document.getElementById('assessProof').value;
+  // 从表单状态中取值（防止 DOM 重渲染导致值丢失）
+  const s = ASSESS_FORM_STATE;
+  const gameId = s.gameId;
+  const gameAccount = s.gameAccount;
+  const curRank = s.curRank;
+  const targetRank = s.targetRank;
+  const contact = s.contact;
+  const proof = s.proof;
   
   if (!gameAccount) return toast('请输入游戏ID');
   if (!curRank) return toast('请输入当前段位');
   if (!targetRank) return toast('请输入目标段位');
   if (!contact) return toast('请输入联系方式');
   
-  DB.assessments.push({
+  const record = {
     id: genId('A'),
     userId: DB.currentUser.id,
     userName: DB.currentUser.nickname,
@@ -5633,15 +5749,27 @@ function submitAssessment() {
     status: 'pending',
     submitTime: Date.now(),
     remark: ''
-  });
+  };
+  DB.assessments.push(record);
   saveData();
   toast('考核已提交，等待审核');
+  
+  // 立即同步到云端，失败则进入离线队列自动重试
+  forceSyncAssessment(record);
+  
+  // 清空表单状态
+  ASSESS_FORM_STATE = { gameId: DB.games[0]?.id || '', gameAccount: '', curRank: '', targetRank: '', contact: '', proof: '' };
+  
   render();
 }
 
 // --- USER PROFILE EDIT (用户端个人资料编辑) ---
 function renderUserProfileEdit() {
   const u = DB.currentUser;
+  // 首次进入初始化昵称默认值
+  if (USER_PROFILE_EDIT_STATE.nickname === undefined || USER_PROFILE_EDIT_STATE.nickname === '') {
+    USER_PROFILE_EDIT_STATE.nickname = u.nickname || '';
+  }
   return `
     <div class="page active">
       <div class="detail-section">
@@ -5657,7 +5785,7 @@ function renderUserProfileEdit() {
         </div>
         <div class="form-group">
           <label class="form-label">昵称</label>
-          <input class="form-input" id="editNickname" value="${u.nickname}" maxlength="20">
+          <input class="form-input" id="editNickname" value="${USER_PROFILE_EDIT_STATE.nickname}" maxlength="20" oninput="USER_PROFILE_EDIT_STATE.nickname=this.value">
           <p style="font-size:11px;color:var(--text-3);margin-top:4px">2-20位字符，昵称可修改</p>
         </div>
         <div class="form-group">
@@ -5670,7 +5798,8 @@ function renderUserProfileEdit() {
 }
 
 async function saveUserProfile() {
-  const nickname = document.getElementById('editNickname')?.value.trim();
+  // 从表单状态取值（防止 DOM 重渲染导致值丢失）
+  const nickname = (USER_PROFILE_EDIT_STATE.nickname || '').trim();
   if (!nickname) { toast('昵称不能为空'); return; }
   if (nickname.length < 2 || nickname.length > 20) { toast('昵称2-20位字符'); return; }
   
@@ -6641,6 +6770,11 @@ function applyWithdraw() {
     toast('暂无可提现金额');
     return;
   }
+  // 初始化提现表单默认值
+  WITHDRAW_FORM_STATE.amount = withdrawable.toFixed(2);
+  if (!WITHDRAW_FORM_STATE.type) WITHDRAW_FORM_STATE.type = 'alipay';
+  const wfs = WITHDRAW_FORM_STATE;
+  
   // 弹出提现申请表单
   showModal(`
     <div>
@@ -6652,27 +6786,27 @@ function applyWithdraw() {
         </div>
         <div class="form-group">
           <label class="form-label">提现金额（元）</label>
-          <input class="form-input" id="wd_amount" type="number" min="1" step="0.01" max="${withdrawable}" placeholder="请输入提现金额" value="${withdrawable.toFixed(2)}">
+          <input class="form-input" id="wd_amount" type="number" min="1" step="0.01" max="${withdrawable}" placeholder="请输入提现金额" value="${wfs.amount}" oninput="WITHDRAW_FORM_STATE.amount=this.value">
           <div style="font-size:11px;color:var(--text-3);margin-top:6px;display:flex;justify-content:space-between">
             <span>可提现 ¥${formatMoney(withdrawable)}</span>
-            <span style="cursor:pointer;color:var(--gold)" onclick="document.getElementById('wd_amount').value=${withdrawable.toFixed(2)}">全部提现</span>
+            <span style="cursor:pointer;color:var(--gold)" onclick="WITHDRAW_FORM_STATE.amount=${withdrawable.toFixed(2)};document.getElementById('wd_amount').value=${withdrawable.toFixed(2)}">全部提现</span>
           </div>
         </div>
         <div class="form-group">
           <label class="form-label">提现方式</label>
-          <select class="form-select" id="wd_type">
-            <option value="alipay">支付宝</option>
-            <option value="wechat">微信</option>
-            <option value="bank">银行卡</option>
+          <select class="form-select" id="wd_type" onchange="WITHDRAW_FORM_STATE.type=this.value">
+            <option value="alipay" ${wfs.type==='alipay'?'selected':''}>支付宝</option>
+            <option value="wechat" ${wfs.type==='wechat'?'selected':''}>微信</option>
+            <option value="bank" ${wfs.type==='bank'?'selected':''}>银行卡</option>
           </select>
         </div>
         <div class="form-group">
           <label class="form-label">收款账号</label>
-          <input class="form-input" id="wd_account" type="text" placeholder="请输入收款账号">
+          <input class="form-input" id="wd_account" type="text" placeholder="请输入收款账号" value="${wfs.account}" oninput="WITHDRAW_FORM_STATE.account=this.value">
         </div>
         <div class="form-group">
           <label class="form-label">备注（选填）</label>
-          <input class="form-input" id="wd_remark" type="text" placeholder="选填">
+          <input class="form-input" id="wd_remark" type="text" placeholder="选填" value="${wfs.remark}" oninput="WITHDRAW_FORM_STATE.remark=this.value">
         </div>
         <button class="btn btn-primary btn-block" onclick="doSubmitWithdraw('${boosterId}')">提交申请</button>
       </div>
@@ -6686,10 +6820,11 @@ function doSubmitWithdraw(boosterId) {
   const booster = getBooster(boosterId);
   if (!booster) { toast('护航师不存在'); return; }
   
-  const amount = parseFloat(document.getElementById('wd_amount').value);
-  const type = document.getElementById('wd_type').value;
-  const account = document.getElementById('wd_account').value.trim();
-  const remark = document.getElementById('wd_remark').value.trim();
+  // 从表单状态取值（防止 DOM 重渲染导致值丢失）
+  const amount = parseFloat(WITHDRAW_FORM_STATE.amount);
+  const type = WITHDRAW_FORM_STATE.type || 'alipay';
+  const account = (WITHDRAW_FORM_STATE.account || '').trim();
+  const remark = (WITHDRAW_FORM_STATE.remark || '').trim();
   
   if (isNaN(amount) || amount <= 0) { toast('请输入正确的提现金额'); return; }
   if (!account) { toast('请输入收款账号'); return; }
@@ -6780,6 +6915,9 @@ function renderReviewManage() {
 
 // ============== 申请成为打手（入驻申请） ==============
 // 表单输入状态（避免 re-render 清空输入，与登录页同样的模式）
+// ============== 表单局部状态（防止页面重渲染时输入内容丢失） ==============
+
+// 打手入驻申请表单状态
 let APPLY_FORM_STATE = {
   nickname: '',
   gameIds: [],
@@ -6788,6 +6926,43 @@ let APPLY_FORM_STATE = {
   contactValue: '',
   intro: '',
   proofText: ''
+};
+
+// 游戏考核表单状态（「我要考核」页面）
+let ASSESS_FORM_STATE = {
+  gameId: '',
+  gameAccount: '',
+  curRank: '',
+  targetRank: '',
+  contact: '',
+  proof: ''
+};
+
+// 问题反馈表单状态
+let FEEDBACK_FORM_STATE = {
+  type: '功能异常',
+  content: '',
+  contact: ''
+};
+
+// 举报打手表单状态
+let REPORT_FORM_STATE = {
+  boosterId: '',
+  reason: '服务态度差',
+  content: ''
+};
+
+// 提现申请表单状态
+let WITHDRAW_FORM_STATE = {
+  amount: '',
+  type: 'alipay',
+  account: '',
+  remark: ''
+};
+
+// 用户端个人资料编辑状态
+let USER_PROFILE_EDIT_STATE = {
+  nickname: ''
 };
 
 function renderApplyBooster() {
@@ -6956,6 +7131,10 @@ function submitBoosterApply() {
   DB.assessments.push(record);
   saveData();
   toast('申请已提交，等待审核');
+  
+  // 立即同步到云端，失败则进入离线队列自动重试
+  forceSyncAssessment(record);
+  
   // 返回上一页（我的页面），显示审核中状态
   STATE.subPage = null;
   render();
@@ -7877,9 +8056,12 @@ function renderAdminAssessments() {
 
   return `
     <div>
-      <div class="inner-tabs" style="max-width:360px;margin-bottom:14px">
-        <div class="inner-tab ${adminAssessTab==='booster'?'active':''}" onclick="adminAssessTab='booster';render()">打手入驻审核${pendingBooster>0?` (${pendingBooster})`:''}</div>
-        <div class="inner-tab ${adminAssessTab==='game'?'active':''}" onclick="adminAssessTab='game';render()">游戏考核</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div class="inner-tabs" style="max-width:360px">
+          <div class="inner-tab ${adminAssessTab==='booster'?'active':''}" onclick="adminAssessTab='booster';render()">打手入驻审核${pendingBooster>0?` (${pendingBooster})`:''}</div>
+          <div class="inner-tab ${adminAssessTab==='game'?'active':''}" onclick="adminAssessTab='game';render()">游戏考核</div>
+        </div>
+        <button class="btn btn-outline btn-sm" onclick="refreshAssessmentsFromCloud()">刷新</button>
       </div>
 
       <div style="overflow-x:auto">
@@ -7899,6 +8081,39 @@ function renderAdminAssessments() {
         </table>
       </div>
     </div>`;
+}
+
+/**
+ * 从云端刷新考核申请列表（只刷新 assessments 表）
+ * - 采用合并策略，不覆盖本地新增的申请
+ * - 管理后台考核管理页「刷新」按钮调用
+ */
+async function refreshAssessmentsFromCloud() {
+  if (!supabaseClient || !SUPABASE_ENABLED) {
+    toast('云端未连接，无法刷新');
+    return;
+  }
+  toast('正在刷新...');
+  try {
+    const { data, error } = await withTimeout(
+      supabaseClient.from('assessments').select('*'),
+      15000
+    );
+    if (error) throw error;
+    
+    const remoteData = toCamel(data || []);
+    const stats = { added: 0, updated: 0, unchanged: 0, localOnly: 0 };
+    DB.assessments = mergeAssessments(DB.assessments || [], remoteData, stats);
+    
+    setTableSyncStatus('assessments', 'success', '', DB.assessments.length);
+    saveData();
+    render();
+    toast(`刷新成功：新增 ${stats.added} 条，更新 ${stats.updated} 条，保留本地 ${stats.localOnly} 条`);
+  } catch (e) {
+    setTableSyncStatus('assessments', 'failed', e.message || '拉取失败', 0);
+    addSyncLog('error', 'assessments', 'pull', '手动刷新失败：' + (e.message || e));
+    toast('刷新失败：' + (e.message || '未知错误'));
+  }
 }
 
 // 打手入驻申请列表行
@@ -7998,6 +8213,15 @@ function approveBoosterApply(id) {
 
   saveData();
   toast('已通过审核，打手账号已创建');
+  // 立即同步审核结果到云端，确保用户端和其他管理端实时看到
+  forceSyncAssessment(a);
+  // 同步新创建的打手账号
+  if (newBooster && supabaseClient && SUPABASE_ENABLED) {
+    supabaseClient.from('boosters').upsert(toSnake(newBooster)).catch(e => {
+      logSupabase('warn', 'boosters', `新打手账号同步失败: ${e.message}`);
+      addToOfflineQueue('boosters', toSnake(newBooster));
+    });
+  }
   render();
 }
 
@@ -8021,6 +8245,8 @@ function rejectBoosterApply(id) {
 
   saveData();
   toast('已拒绝');
+  // 立即同步审核结果到云端
+  forceSyncAssessment(a);
   render();
 }
 
@@ -8058,6 +8284,8 @@ function assessAction(id, status) {
     a.reviewTime = Date.now();
     saveData();
     toast('审核完成');
+    // 立即同步审核结果到云端
+    forceSyncAssessment(a);
     render();
   }
 }
@@ -9237,8 +9465,15 @@ function renderAdminSettings() {
           <button class="btn btn-outline btn-sm" onclick="pushToSupabaseManual()">推送本地</button>
           <button class="btn btn-outline btn-sm" onclick="loadCloudStats()">云端数据量</button>
           <button class="btn btn-outline btn-sm" onclick="retryFailedTables()">重试失败表</button>
+          <button class="btn btn-outline btn-sm" onclick="runSyncDiagnosis()" style="border-color:#8b5cf6;color:#8b5cf6">一键诊断</button>
           <button class="btn btn-outline btn-sm" onclick="restoreLocalOrdersManual()" style="border-color:#f59e0b;color:#f59e0b">恢复订单备份</button>
           <button class="btn btn-outline btn-sm" onclick="forceFullSyncFromCloud()" style="border-color:#10b981;color:#10b981">强制全量同步</button>
+        </div>
+        
+        <!-- 诊断结果展示区 -->
+        <div id="diagnosisResult" style="margin-top:12px;display:none">
+          <div style="font-size:12px;font-weight:500;margin-bottom:6px;color:var(--text-2)">同步诊断报告</div>
+          <div id="diagnosisContent" style="max-height:200px;overflow-y:auto;padding:10px;background:#1a1a2e;border-radius:8px;font-size:11px;font-family:monospace;line-height:1.7;color:var(--text-2)"></div>
         </div>
         
         <!-- 同步日志 -->
@@ -9342,6 +9577,156 @@ function syncFromSupabaseManual() {
     }
     render();
   });
+}
+
+/**
+ * 一键诊断：检查 Supabase 连接、表存在性、RLS 状态、最近同步状态
+ * - 检测连接是否正常
+ * - 抽样检测 orders / assessments / users 等关键表是否存在
+ * - 检测 RLS 是否启用（通过尝试一条无权限查询判断）
+ * - 显示所有表最近一次同步状态统计
+ * - 显示离线队列数量
+ */
+async function runSyncDiagnosis() {
+  const box = document.getElementById('diagnosisResult');
+  const content = document.getElementById('diagnosisContent');
+  if (!box || !content) return;
+  box.style.display = 'block';
+  content.innerHTML = '<span style="color:#fbbf24">🔍 正在诊断，请稍候...</span>';
+  
+  const lines = [];
+  const addLine = (text, color = '') => {
+    const c = color ? ` style="color:${color}"` : '';
+    lines.push(`<div${c}>${text}</div>`);
+  };
+  
+  addLine('━━━ 同步诊断报告 ━━━', '#60a5fa');
+  addLine('');
+  
+  // 1. 基础状态
+  addLine(`客户端状态: ${SUPABASE_ENABLED ? '已启用' : '未启用'}`, SUPABASE_ENABLED ? '#22c55e' : '#ef4444');
+  addLine(`Supabase 实例: ${supabaseClient ? '已创建' : '未创建'}`, supabaseClient ? '#22c55e' : '#ef4444');
+  addLine(`最后同步: ${SUPABASE_LAST_SYNC ? new Date(SUPABASE_LAST_SYNC).toLocaleString() : '从未同步'}`);
+  if (SUPABASE_LAST_ERROR) addLine(`最近错误: ${SUPABASE_LAST_ERROR}`, '#ef4444');
+  addLine(`离线队列: ${SUPABASE_OFFLINE_QUEUE.length} 条待发送`, SUPABASE_OFFLINE_QUEUE.length > 0 ? '#f59e0b' : '#22c55e');
+  addLine('');
+  
+  if (!supabaseClient) {
+    addLine('❌ Supabase 客户端未初始化，无法进行云端诊断', '#ef4444');
+    content.innerHTML = lines.join('');
+    return;
+  }
+  
+  // 2. 连接测试
+  addLine('▶ 连接测试中...', '#60a5fa');
+  content.innerHTML = lines.join('');
+  
+  try {
+    const t0 = Date.now();
+    const { data, error } = await withTimeout(
+      supabaseClient.from('settings').select('id').limit(1),
+      10000
+    );
+    const latency = Date.now() - t0;
+    
+    if (error) {
+      addLine(`❌ 连接失败: ${error.message}`, '#ef4444');
+      
+      // 分析错误类型
+      if (error.message?.includes('relation') || error.message?.includes('does not exist')) {
+        addLine('   → 原因：settings 表不存在，请点击「初始化数据库」', '#f59e0b');
+      } else if (error.message?.includes('permission') || error.message?.includes('policy') || error.code === '42501') {
+        addLine('   → 原因：RLS 未配置策略，请执行禁用 RLS 的 SQL', '#f59e0b');
+      } else if (error.message?.includes('Failed to fetch') || error.message?.includes('network')) {
+        addLine('   → 原因：网络问题，无法连接到 Supabase', '#f59e0b');
+      }
+    } else {
+      addLine(`✅ 连接正常 (延迟 ${latency}ms)`, '#22c55e');
+    }
+  } catch (e) {
+    addLine(`❌ 连接超时/异常: ${e.message}`, '#ef4444');
+  }
+  
+  addLine('');
+  
+  // 3. 关键表存在性检查（抽样）
+  const keyTables = ['orders', 'assessments', 'users', 'boosters', 'withdrawals', 'recharges'];
+  addLine('▶ 关键表存在性检查:', '#60a5fa');
+  content.innerHTML = lines.join('');
+  
+  let tableOk = 0;
+  let tableFail = 0;
+  for (const table of keyTables) {
+    try {
+      const { error } = await withTimeout(
+        supabaseClient.from(table).select('id').limit(1),
+        5000
+      );
+      if (error) {
+        addLine(`  ❌ ${table}: ${error.message}`, '#ef4444');
+        tableFail++;
+      } else {
+        addLine(`  ✅ ${table}: 存在`, '#22c55e');
+        tableOk++;
+      }
+    } catch (e) {
+      addLine(`  ❌ ${table}: ${e.message}`, '#ef4444');
+      tableFail++;
+    }
+    content.innerHTML = lines.join('');
+  }
+  
+  addLine('');
+  addLine(`表检测结果: ${tableOk}/${keyTables.length} 通过`, tableFail === 0 ? '#22c55e' : '#f59e0b');
+  if (tableFail > 0) {
+    addLine('💡 建议：点击「初始化数据库」获取建表 SQL，在 Supabase 执行', '#f59e0b');
+  }
+  
+  addLine('');
+  
+  // 4. RLS 简单检测：尝试插入一条明显会被 RLS 阻止的记录
+  addLine('▶ RLS 检测 (写入测试):', '#60a5fa');
+  content.innerHTML = lines.join('');
+  
+  try {
+    const testId = 'diag_test_' + Date.now();
+    const { error } = await withTimeout(
+      supabaseClient.from('settings').select('id').limit(1),
+      5000
+    );
+    if (error && (error.code === '42501' || error.message?.includes('policy') || error.message?.includes('permission'))) {
+      addLine('  ⚠️ 检测到 RLS 限制，建议禁用 RLS 或配置策略', '#f59e0b');
+      addLine('  → 点击下方 SQL 代码块复制并在 Supabase 执行', '#f59e0b');
+    } else {
+      addLine('  ✅ 查询权限正常', '#22c55e');
+    }
+  } catch (e) {
+    addLine(`  ⚠️ RLS 检测跳过: ${e.message}`, '#f59e0b');
+  }
+  
+  addLine('');
+  
+  // 5. 各表同步状态汇总
+  addLine('▶ 各表同步状态汇总:', '#60a5fa');
+  const allTables = Object.keys(SYNC_TABLE_STATUS);
+  if (allTables.length === 0) {
+    addLine('  (暂无同步记录)', '#9ca3af');
+  } else {
+    const successTables = allTables.filter(t => SYNC_TABLE_STATUS[t]?.status === 'success');
+    const failedTables = allTables.filter(t => SYNC_TABLE_STATUS[t]?.status === 'failed');
+    addLine(`  成功: ${successTables.length} 表`, '#22c55e');
+    if (failedTables.length > 0) {
+      addLine(`  失败: ${failedTables.length} 表`, '#ef4444');
+      failedTables.forEach(t => {
+        addLine(`    • ${t}: ${SYNC_TABLE_STATUS[t]?.error || '未知错误'}`, '#ef4444');
+      });
+    }
+  }
+  
+  addLine('');
+  addLine('━━━ 诊断完成 ━━━', '#60a5fa');
+  
+  content.innerHTML = lines.join('');
 }
 
 function pushToSupabaseManual() {
