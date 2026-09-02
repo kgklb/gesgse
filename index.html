@@ -525,6 +525,38 @@ async function withRetry(fn, retries = 1, delayMs = 1000) {
 
 // 离线写入队列：写入失败的操作暂存，网络恢复后重试
 let SUPABASE_OFFLINE_QUEUE = [];
+const OFFLINE_QUEUE_STORAGE_KEY = 'supabase_offline_queue';
+
+/** 从 localStorage 加载离线队列（页面刷新后恢复） */
+function loadOfflineQueue() {
+  try {
+    const raw = localStorage.getItem(OFFLINE_QUEUE_STORAGE_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        SUPABASE_OFFLINE_QUEUE = arr;
+        if (arr.length > 0) {
+          logSupabase('info', 'queue', `从本地恢复 ${arr.length} 条离线操作`);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[Queue] 加载离线队列失败:', e.message);
+  }
+}
+
+/** 将离线队列持久化到 localStorage */
+function saveOfflineQueue() {
+  try {
+    if (SUPABASE_OFFLINE_QUEUE.length === 0) {
+      localStorage.removeItem(OFFLINE_QUEUE_STORAGE_KEY);
+    } else {
+      localStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(SUPABASE_OFFLINE_QUEUE));
+    }
+  } catch (e) {
+    console.warn('[Queue] 保存离线队列失败:', e.message);
+  }
+}
 let SUPABASE_QUEUE_TIMER = null;
 
 // ============== AUTH (登录认证) ==============
@@ -617,7 +649,7 @@ async function registerUser(nickname, password) {
   }
 
   const userId = 'u_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
-  const userData = {
+  const cloudUserData = {
     id: userId,
     username: '',
     phone: '',
@@ -625,44 +657,12 @@ async function registerUser(nickname, password) {
     nickname: nick,
     avatar: nick.charAt(0) || '玩',
     balance: 0,
-    vip_level: '普通会员',
+    vipLevel: '普通会员',
     status: 1,
-    created_at: new Date().toISOString()
+    createdAt: new Date().toISOString()
   };
 
-  // 优先写入 Supabase
-  if (supabaseClient && SUPABASE_ENABLED) {
-    try {
-      // 先检查昵称是否已注册
-      const { data: existData, error: existErr } = await supabaseClient
-        .from('users')
-        .select('id,nickname')
-        .eq('nickname', nick)
-        .limit(1);
-      if (existErr && existErr.code !== 'PGRST116') {
-        console.warn('[Auth] 注册查询失败，降级本地:', existErr.message);
-      } else if (existData && existData.length > 0) {
-        return { success: false, message: '昵称已被注册' };
-      }
-
-      // 插入新用户
-      const { error } = await supabaseClient.from('users').insert(userData);
-      if (error) {
-        console.warn('[Auth] Supabase 注册写入失败:', error.message);
-        // 记录到同步日志，便于排查
-        addSyncLog('error', 'users', 'push', `注册写入失败: ${error.message}`);
-        // 写入失败进入离线队列，后续自动重试
-        addToOfflineQueue('users', userData);
-      } else {
-        logAuth('register', `Supabase 用户注册成功: ${userId}`);
-        addSyncLog('info', 'users', 'push', `新用户注册并写入云端: ${nick}`);
-      }
-    } catch (e) {
-      console.warn('[Auth] 注册异常:', e.message);
-    }
-  }
-
-  // 写入本地 DB
+  // ====== 先写入本地（保证注册立即可用，不阻塞） ======
   DB.currentUser = {
     id: userId,
     username: '',
@@ -691,24 +691,75 @@ async function registerUser(nickname, password) {
   AUTH_STATE.isLoggedIn = true;
   saveAuthState();
 
-  saveData(false); // 先保存到本地 localStorage（不上云，因为会单独 forceSync）
-  
-  // 【关键】注册后立即把新用户写入云端（不等待防抖）
-  // 失败则进入离线队列，保证后续会自动重试
-  forceSyncUser({
-    id: userId,
-    nickname: nick,
-    avatar: DB.currentUser.avatar,
-    balance: 0,
-    vipLevel: '普通会员',
-    password: password,
-    status: 1,
-    createdAt: Date.now()
-  }).catch(e => {
-    logSupabase('warn', 'register', `新用户写入云端失败，将自动重试: ${e.message}`);
-  });
+  saveData(false); // 保存到本地 localStorage
 
-  return { success: true, message: '注册成功', userId };
+  // ====== 云端同步（异步进行，等待结果但不阻塞注册成功） ======
+  // 默认认为未同步，后面根据结果更新
+  let cloudSynced = false;
+  let cloudMessage = '';
+
+  if (supabaseClient && SUPABASE_ENABLED) {
+    try {
+      // 先检查昵称是否已在云端注册（防重）
+      try {
+        const { data: existData, error: existErr } = await withTimeout(
+          supabaseClient
+            .from('users')
+            .select('id,nickname')
+            .eq('nickname', nick)
+            .limit(1),
+          5000
+        );
+        if (existErr && existErr.code !== 'PGRST116') {
+          addSyncLog('warn', 'users', 'push', `注册查重失败: ${existErr.message}`);
+          console.warn('[Auth] 注册查重失败:', existErr.message);
+        } else if (existData && existData.length > 0) {
+          // 云端已有该昵称，回滚本地写入并返回失败
+          DB.users = DB.users.filter(u => u.id !== userId);
+          DB.currentUser = null;
+          AUTH_STATE.userId = null;
+          AUTH_STATE.isLoggedIn = false;
+          localStorage.removeItem(USER_ID_KEY);
+          saveAuthState();
+          saveData(false);
+          return { success: false, message: '昵称已被注册' };
+        }
+      } catch (e) {
+        // 查重失败不阻止注册，继续尝试写入
+        addSyncLog('warn', 'users', 'push', `注册查重异常: ${e.message}`);
+      }
+
+      // 写入云端（统一走 forceSyncUser，失败自动进入离线队列）
+      const ok = await forceSyncUser(cloudUserData);
+      cloudSynced = ok;
+      if (ok) {
+        cloudMessage = '已同步到云端';
+        addSyncLog('info', 'users', 'push', `新用户注册并写入云端: ${nick}`);
+      } else {
+        cloudMessage = '云端同步失败，已加入后台重试队列';
+        addSyncLog('warn', 'users', 'push', `注册写入失败，已进入离线队列: ${nick}`);
+      }
+    } catch (e) {
+      cloudMessage = '云端同步异常，已加入后台重试队列';
+      addSyncLog('error', 'users', 'push', `注册写入异常: ${e.message}`);
+      console.warn('[Auth] 注册云端写入异常:', e.message);
+      // 失败也进离线队列（forceSyncUser 内部会加，这里兜底）
+      if (supabaseClient) addToOfflineQueue('users', toSnake(cloudUserData));
+    }
+  } else {
+    // Supabase 未连接：直接加入离线队列，等连接后自动重试
+    cloudMessage = '云端未连接，已加入同步队列';
+    addSyncLog('info', 'users', 'push', `新用户注册（本地），已加入离线队列: ${nick}`);
+    addToOfflineQueue('users', toSnake(cloudUserData));
+  }
+
+  return {
+    success: true,
+    message: '注册成功',
+    userId,
+    cloudSynced,
+    cloudMessage
+  };
 }
 
 // 用户登录（昵称+密码，兼容老用户 username/phone 作为登录名）
@@ -1740,6 +1791,8 @@ function loadData() {
     } else {
       initSeedData();
     }
+    // 加载离线队列（上次未同步成功的操作，刷新后恢复）
+    loadOfflineQueue();
     // 尝试从 Supabase 加载
     loadSupabaseInBackground();
   } catch (e) {
@@ -1768,7 +1821,7 @@ async function loadSupabaseInBackground() {
       try { subscribeOrdersRealtime(); } catch (e) { logSupabase('warn', 'realtime', '订单订阅失败: ' + e.message); }
       try { subscribeChatRealtime(); } catch (e) { logSupabase('warn', 'realtime', '聊天订阅失败: ' + e.message); }
       await ensureCurrentUser();
-      // 重放离线队列
+      // 重放离线队列（首次同步成功后，把之前离线时攒的操作推上去）
       flushOfflineQueue();
       render();
     } else {
@@ -2382,6 +2435,7 @@ async function syncFromSupabase() {
 // ============ 离线队列 ============
 function addToOfflineQueue(table, record, mode = 'upsert') {
   SUPABASE_OFFLINE_QUEUE.push({ table, record, mode, time: Date.now() });
+  saveOfflineQueue(); // 持久化，刷新不丢
   logSupabase('warn', 'queue', `加入离线队列: ${table} (${SUPABASE_OFFLINE_QUEUE.length} 条)`);
   scheduleFlushQueue();
 }
@@ -2416,6 +2470,7 @@ async function flushOfflineQueue() {
   if (success > 0) {
     logSupabase('info', 'queue', `重放成功 ${success}/${queue.length} 条`);
   }
+  saveOfflineQueue(); // 持久化剩余待重发项
   if (SUPABASE_OFFLINE_QUEUE.length > 0) {
     scheduleFlushQueue();
   }
@@ -2449,7 +2504,11 @@ async function forceSyncUser(user) {
   }
   try {
     const payload = toSnake(user);
-    const { error } = await supabaseClient.from('users').upsert(payload);
+    // 10 秒超时，避免网络慢时卡住
+    const { error } = await withTimeout(
+      supabaseClient.from('users').upsert(payload),
+      10000
+    );
     if (error) throw error;
     logSupabase('info', 'user', `用户已同步: ${user.id} (${user.nickname || '-'})`);
     return true;
@@ -4121,7 +4180,14 @@ async function doRegister() {
   try {
     const result = await registerUser(nickname, password);
     if (result.success) {
-      toast('注册成功');
+      // 根据云端同步结果显示不同提示
+      if (result.cloudSynced) {
+        toast('注册成功 · 已同步到云端');
+      } else if (result.cloudMessage) {
+        toast('注册成功 · ' + result.cloudMessage);
+      } else {
+        toast('注册成功');
+      }
       DB.currentIdentity = 'user';
       STATE.page = 'home';
       STATE.subPage = null;
@@ -10990,6 +11056,30 @@ async function loadCloudStats() {
       html += `<div>${labels[t]}</div><div style="text-align:right;${cloudColor}"${errTip}>${cloudCount}</div><div style="text-align:right;${localColor}">${localCount}</div>`;
     });
     html += '</div>';
+    // 统计有错误的表，显示诊断信息
+    const failedTables = results.filter(r => r.error);
+    if (failedTables.length > 0) {
+      html += '<div style="margin-top:10px;padding:8px 10px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:6px;font-size:11px">';
+      html += '<div style="color:#ef4444;font-weight:500;margin-bottom:4px">⚠️ 云端读取失败诊断</div>';
+      failedTables.forEach(r => {
+        const err = r.error || {};
+        const code = err.code || '';
+        const msg = err.message || JSON.stringify(err).slice(0, 100);
+        let hint = '';
+        if (code === '42501' || msg.includes('permission denied') || msg.includes('policy')) {
+          hint = '→ RLS 策略拒绝了匿名读取，请在 Supabase SQL 执行：ALTER TABLE ' + r.table + ' DISABLE ROW LEVEL SECURITY;';
+        } else if (code === '42P01' || msg.includes('does not exist') || msg.includes('relation')) {
+          hint = '→ 表不存在，请点击「初始化数据库」建表';
+        } else if (msg.includes('Failed to fetch') || msg.includes('NetworkError')) {
+          hint = '→ 网络不通，检查 Supabase URL 是否正确';
+        } else if (msg.includes('Invalid API key') || msg.includes('JWT')) {
+          hint = '→ API Key 错误，检查 SUPABASE_ANON_KEY 配置';
+        }
+        html += `<div style="margin-bottom:4px"><strong>${r.table}</strong>: ${escapeHtml(msg)} ${code ? '(' + code + ')' : ''}</div>`;
+        if (hint) html += `<div style="color:#f59e0b;margin-bottom:6px">${escapeHtml(hint)}</div>`;
+      });
+      html += '</div>';
+    }
     // 一键测试写入按钮
     html += `<div style="margin-top:10px;display:flex;gap:8px;align-items:center">
       <button class="btn btn-sm" style="background:#10b981;color:#fff;border:none;cursor:pointer" onclick="testCloudWrite()">一键测试写入</button>
